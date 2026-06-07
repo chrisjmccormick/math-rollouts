@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "math-rollouts"
+version = "0.1.0"
+description = "Naturally-sampled math rollouts + uniform-opener/branch nuclei, with a unified thinking/non-thinking generator and a separate scoring pass."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pandas",
+    "pyarrow",
+    "anytree",
+    "math-verify",
+    "datasets",
+    "huggingface_hub",
+]
+
+[project.optional-dependencies]
+# GPU generation deps; kept optional so CPU-only consumers (scoring, analysis,
+# data loading) can install without vLLM/torch.
+gen = [
+    "torch",
+    "transformers",
+    "vllm",
+]
+dev = [
+    "pytest",
+]
+
+[project.scripts]
+math-rollouts-generate = "math_rollouts.generate.run:main"
+math-rollouts-score = "math_rollouts.score.run:main"
+math-rollouts-policies = "math_rollouts.analysis.policies:main"
+math-rollouts-bandtable = "math_rollouts.analysis.bandtable:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

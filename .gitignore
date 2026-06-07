@@ -1,0 +1,27 @@
+# Data lives in the HF dataset, never in git.
+*.parquet
+*.safetensors
+*.arrow
+
+# Local caches / scratch
+_hf_cache/
+_scratch/
+wandb/
+logs/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
