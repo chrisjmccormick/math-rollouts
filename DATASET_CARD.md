@@ -34,10 +34,10 @@ pull parquets independently, and keeps generation reproducible from code.
 
 ```
 problems/
-  math500.parquet            500 MATH-500 problems (native test/<subj>/<n>.json ids)
-  math_problems.parquet      12,496-problem MATH superset ("math12k", train/<subj>/<n> ids)
+  math500.parquet            the 500 math500-split problems (+ hf MATH-500 cross-ref)
+  math_problems.parquet      the full ~12.5k MATH superset ("math12k"), with `split`
 mappings/
-  math500_to_math12k.{csv,json}   math500_native_id  <->  math12k unique_id
+  math500_to_hf.csv          unique_id  <->  hf MATH-500 id (test/<subj>/<n>.json)
 generations/<model-slug>/
   <experiment>/              the unified-generator split (nuclei + raw rollouts + scores)
     nuclei.parquet
@@ -51,19 +51,24 @@ generations/<model-slug>/
 `model-slug` = lowercase HF id minus the org (`Qwen/Qwen2.5-Math-1.5B` ->
 `qwen2.5-math-1.5b`; `sail/Qwen2.5-Math-1.5B-Oat-Zero` -> `qwen2.5-math-1.5b-oat-zero`).
 
-## Two id schemes
+## Ids and splits
 
-Rows carry one of two problem-identity conventions; the `mappings/` table and the
-`math500_native_id` column bridge them:
+Every row has **one** problem id, `unique_id = <split>/<subj>/<n>`, where `split` is
+one of **`train`** / **`test`** / **`math500`** and `<n>` is the stable math12k
+number. The split is authoritative (also a column in `math_problems.parquet`):
 
-| scheme | example | where |
+| split | count | meaning |
 |---|---|---|
-| **math12k native** | `train/geometry/9467` | `unique_id` in the pools + `math_problems.parquet` |
-| **MATH-500 native** | `test/geometry/627.json` | `unique_id` in the experiment split + `math500_native_id` everywhere |
+| `train` | 7,496 | math12k train portion |
+| `test`  | 4,500 | math12k test portion (excluding math500) |
+| `math500` | 500 | the MATH-500 subset, **held out of `test`** |
 
-So a MATH-500 problem can appear under a `train/...` `unique_id` while still carrying
-`math500_native_id = test/.../<n>.json` — filter on `math500_native_id` to pin a
-MATH-500 problem regardless of file.
+So `math500/geometry/9467` is the MATH-500 geometry problem that lives at math12k
+index 9467. The same id is used everywhere — pools, experiment files, and
+`policies.csv` (older files keyed math500 problems by the HF id `test/.../<n>.json`;
+that's gone). To recover the canonical HF MATH-500 id (e.g. `test/geometry/627.json`,
+for matching published numbers), join `mappings/math500_to_hf.csv`. There is no
+longer a second id column on the bulk rows.
 
 ## Models
 
@@ -94,10 +99,12 @@ not pool across them.
 
 ### `problems/`
 
-`math500.parquet` (500 rows): `math500_native_id`, `unique_id`, `subject`, `subj`,
-`level`, `problem`, `solution`, `answer`.
-`math_problems.parquet` (12,496 rows, the math12k superset): `unique_id`, `source_idx`,
-`split`, `subject`, `subj`, `level`, `problem`, `solution`, `answer`.
+`math500.parquet` (500 rows): `unique_id` (`math500/...`), `math500_native_id` (the
+hf MATH-500 cross-ref, kept here), `subject`, `subj`, `level`, `problem`, `solution`,
+`answer`.
+`math_problems.parquet` (12,496 rows, the math12k superset): `unique_id`
+(`<split>/...`), `source_idx`, `split`, `subject`, `subj`, `level`, `problem`,
+`solution`, `answer`.
 
 ### Experiment split — `generations/<model>/<experiment>/`
 
@@ -107,13 +114,13 @@ scoring are separate**: `rollouts.parquet` is RAW (no correctness); `scores.parq
 is derived under a versioned `scorer_id` and re-runnable on CPU.
 
 **`nuclei.parquet`** — one row per OPENER (= leaf of the nucleus tree):
-`model_id`, `unique_id`, `math500_native_id`, `subject`, `answer`, `depth`,
+`model_id`, `unique_id`, `subject`, `answer`, `depth`,
 `branch_path` (child-index at each fork, root->leaf — the durable opener identity),
 `opener_token_ids`, `opener_token_strs`, `fork_token_id`, `nuc_prob` (renormalized
 inbound prob), `path_prob`, `branch_size`, `terminal`, `is_thinking`.
 
 **`rollouts.parquet`** — RAW forced samples, one row per sample (no correctness):
-`model_id`, `unique_id`, `math500_native_id`, `subject`, `answer`, `depth`,
+`model_id`, `unique_id`, `subject`, `answer`, `depth`,
 `branch_path`, `opener_token_ids`, `run_id`, `gen_config_id`, `seed`, `temperature`,
 `top_p`, `max_gen_len`, `sample_idx`, `completion_token_ids`, `completion_text`
 (includes the forced opener), `num_tokens`, `finish_reason`.
@@ -138,12 +145,11 @@ These are NOT opener-forced — the model chose its own first token. Pools inclu
 `math500_passK`, `math12k_passK`, `math12k_K64`, `math12k_L4_5_K64`, `math12k_additional`
 (availability varies by model). Columns:
 
-`unique_id` (math12k id), `problem_idx`, `run_id`, `sample_idx`, `producer`
+`unique_id` (`<split>/...`), `problem_idx`, `run_id`, `sample_idx`, `producer`
 (e.g. `random`), `completion_text`, `completion_token_ids`, `num_tokens`,
 `initial_num_tokens`, `is_correct`, `finish_reason`, `closed_think`, `n_inside_think`,
 `n_post_think`, `seed`, `temperature`, `top_p`, `model_id`, `max_gen_len`,
-`gen_config_id`, `timestamp`, `subject`, `level`, `answer` (+ `math500_native_id` on the
-`math500_*` pools). The `*_think` columns are generic carry-overs and are inert for
+`gen_config_id`, `timestamp`, `subject`, `level`, `answer`. The `*_think` columns are generic carry-overs and are inert for
 these non-thinking models.
 
 ## Grouping & accuracy
@@ -171,9 +177,9 @@ df = load_scored_rollouts("Qwen/Qwen2.5-Math-1.5B", "math500_uniform_k16_d1")
 # nuclei (one row per opener)
 nuc = load_nuclei("Qwen/Qwen2.5-Math-1.5B", "math500_uniform_k16_d1")
 
-# a naturally-sampled pool
+# a naturally-sampled pool, one MATH-500 problem (= hf test/geometry/627.json)
 pool = load_generation_parquet("Qwen/Qwen2.5-Math-1.5B", "math500_passK")
-geom = pool[pool.math500_native_id == "test/geometry/627.json"]
+geom = pool[pool.unique_id == "math500/geometry/9467"]
 ```
 
 Point at a local snapshot with `MATH_ROLLOUTS_DATA=/path/to/dataset`; otherwise files
