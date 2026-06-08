@@ -44,6 +44,16 @@ def experiment_dir(model_id: str, experiment: str) -> str:
     return f"generations/{model_slug(model_id)}/{experiment}"
 
 
+def load_generation_parquet(model_id: str, name: str, **kw):
+    """Load a standalone ``generations/<model-slug>/<name>.parquet`` (not part of an
+    experiment dir), e.g. ``name="math500_passK"`` — the naturally-sampled rollout
+    pools. ``name`` may include or omit the ``.parquet`` suffix."""
+    import pandas as pd
+    if not name.endswith(".parquet"):
+        name += ".parquet"
+    return pd.read_parquet(_resolve(f"generations/{model_slug(model_id)}/{name}", **kw))
+
+
 def load_nuclei(model_id: str, experiment: str, **kw):
     import pandas as pd
     return pd.read_parquet(_resolve(f"{experiment_dir(model_id, experiment)}/nuclei.parquet", **kw))

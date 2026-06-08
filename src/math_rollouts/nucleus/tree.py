@@ -22,6 +22,8 @@ import torch
 from anytree import Node
 from transformers.cache_utils import DynamicCache
 
+from .recipe import compute_nucleus
+
 
 class NucleusTree:
     def __init__(self, model, tok, adapter, cfg, *, max_depth: int = 1,
@@ -38,17 +40,10 @@ class NucleusTree:
 
     # ---- model / nucleus ----
     def _nucleus(self, logits):
-        """Renormalized nucleus: softmax(logits/T), top_k cap, top_p keep (always
-        keep the top token). Returns (ids, probs) parallel lists."""
-        pr = torch.softmax(logits.float() / self.cfg.temperature, dim=-1)
-        sp, si = torch.sort(pr, descending=True)
-        sp, si = sp[: self.cfg.top_k], si[: self.cfg.top_k]
-        keep = (torch.cumsum(sp, 0) - sp) < self.cfg.top_p
-        keep[0] = True
-        ids = [int(t) for t in si[keep].tolist()]
-        p = sp[keep]
-        p = (p / p.sum()).tolist()
-        return ids, [round(x, 6) for x in p]
+        """Renormalized nucleus via the shared recipe (``recipe.compute_nucleus``):
+        softmax(logits/T), top_k cap, top_p keep (always keep the top token)."""
+        return compute_nucleus(logits, temperature=self.cfg.temperature,
+                               top_p=self.cfg.top_p, top_k=self.cfg.top_k)
 
     def _prime(self, ids):
         self.cache = DynamicCache()
