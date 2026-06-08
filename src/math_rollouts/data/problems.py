@@ -1,15 +1,11 @@
-"""MATH-500 evaluation loader + subject shorthand + boxed-answer extraction.
+"""Problem loaders over the dataset's own split-aware ``problems/`` tables, plus
+subject shorthand + boxed-answer extraction.
 
-Ported from the source project's ``load_math.py`` but trimmed to the
-eval-relevant surface and made self-contained: MATH-500 is read from the official
-HuggingFace mirror (``HuggingFaceH4/MATH-500``), which carries native ids
-(``test/<subject>/<n>.json``), so no local annotated table is required.
+Problems come from ``problems/math_problems.parquet`` (split-aware ``unique_id`` +
+``split`` column) — the dataset's own authoritative table — so there is no external
+MATH-500 dependency: the ``math500`` split *is* our held-out test set.
 """
 from __future__ import annotations
-
-import re
-
-MATH500_DATASET_ID = "HuggingFaceH4/MATH-500"
 
 _SUBJECT_NORMALIZE = {
     "algebra": "Algebra",
@@ -66,16 +62,6 @@ def subject_short(value: str) -> str:
     return SUBJECT_SHORT.get(_normalize_subject(v), v)
 
 
-def _parse_level(raw) -> int:
-    if isinstance(raw, int):
-        return raw
-    if isinstance(raw, str):
-        m = re.search(r"\d+", raw)
-        if m:
-            return int(m.group(0))
-    return -1
-
-
 def extract_boxed_answer(solution: str) -> str:
     """Contents of the final ``\\boxed{...}`` in a solution (balanced-brace scan)."""
     idx = solution.rfind("\\boxed{")
@@ -93,34 +79,6 @@ def extract_boxed_answer(solution: str) -> str:
                 return solution[start:i]
         i += 1
     return ""
-
-
-def _row_to_problem(row: dict) -> dict | None:
-    subject = _normalize_subject(row.get("subject", ""))
-    solution = row.get("solution", "")
-    answer = row.get("answer") or extract_boxed_answer(solution)
-    if not answer:
-        return None
-    return {
-        "unique_id": row["unique_id"],           # native test/<subject>/<n>.json
-        "subject": subject,
-        "subj": subject_short(subject),
-        "level": _parse_level(row.get("level", -1)),
-        "problem": row["problem"],
-        "solution": solution,
-        "answer": answer,
-    }
-
-
-def load_math500(*, dataset_id: str = MATH500_DATASET_ID, split: str = "test") -> list[dict]:
-    """Load the full MATH-500 benchmark (native ids) for generation/eval."""
-    from datasets import load_dataset
-
-    ds = load_dataset(dataset_id, split=split)
-    out = [p for p in (_row_to_problem(r) for r in ds) if p is not None]
-    print(f"[math_rollouts] loaded {len(out)} MATH-500 problems "
-          f"from {dataset_id}:{split} ({len(ds)} rows)", flush=True)
-    return out
 
 
 def _table_problem(r) -> dict:
@@ -148,23 +106,5 @@ def load_problems_by_ids(ids: list[str], **kw) -> list[dict]:
     missing = want - {p["unique_id"] for p in out}
     if missing:
         print(f"[math_rollouts] warning: {len(missing)} ids not in math_problems "
-              f"(first: {sorted(missing)[:3]})", flush=True)
-    return out
-
-
-def load_math500_by_ids(ids: list[str], *, dataset_id: str = MATH500_DATASET_ID,
-                        split: str = "test") -> list[dict]:
-    """Fetch a MATH-500 subset by native unique_id."""
-    if not ids:
-        return []
-    from datasets import load_dataset
-
-    wanted = set(ids)
-    ds = load_dataset(dataset_id, split=split)
-    out = [p for p in (_row_to_problem(r) for r in ds
-                       if r.get("unique_id") in wanted) if p is not None]
-    missing = wanted - {p["unique_id"] for p in out}
-    if missing:
-        print(f"[math_rollouts] warning: {len(missing)} requested ids not found "
               f"(first: {sorted(missing)[:3]})", flush=True)
     return out
