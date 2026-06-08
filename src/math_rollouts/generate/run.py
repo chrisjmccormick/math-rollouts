@@ -40,13 +40,12 @@ def _git_sha() -> str | None:
 
 
 def _load_problems(coverage: str, ids: list[str] | None):
-    from ..data.problems import load_math500, load_math500_by_ids
+    """Problems come from the dataset's own split-aware ``math_problems.parquet``;
+    ``coverage`` is the split name (train | test | math500)."""
+    from ..data.problems import load_problems_by_ids, load_problems_by_split
     if ids:
-        return load_math500_by_ids(ids)
-    if coverage == "math500":
-        return load_math500()
-    raise ValueError(f"unknown coverage {coverage!r} (only 'math500' wired in v1; "
-                     "pass --ids for a subset)")
+        return load_problems_by_ids(ids)
+    return load_problems_by_split(coverage)
 
 
 def generate(*, model_id: str, experiment: str, out_root: str, k: int,
@@ -117,9 +116,10 @@ def main(argv: list[str] | None = None) -> None:
     ap.add_argument("--max-branch", type=int, default=None)
     ap.add_argument("--run-id", type=int, default=0)
     ap.add_argument("--seed", type=int, default=None)
-    ap.add_argument("--coverage", default="math500", choices=["math500"])
+    ap.add_argument("--coverage", default="math500",
+                    choices=["math500", "test", "train"], help="split to generate over")
     ap.add_argument("--ids", nargs="*", default=None,
-                    help="explicit native unique_ids (overrides --coverage)")
+                    help="explicit <split>/<subj>/<n> unique_ids (overrides --coverage)")
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args(argv)
     generate(model_id=a.model_id, experiment=a.experiment, out_root=a.out_root,

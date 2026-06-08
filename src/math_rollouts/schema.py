@@ -31,8 +31,7 @@ _I32 = pa.int32()
 
 NUCLEI_SCHEMA = pa.schema([
     ("model_id", pa.string()),
-    ("unique_id", pa.string()),
-    ("math500_native_id", pa.string()),       # nullable; test/<subj>/<n>.json
+    ("unique_id", pa.string()),                # <split>/<subj>/<n>; split in train|test|math500
     ("subject", pa.string()),
     ("answer", pa.string()),
     ("depth", pa.int8()),                      # leaf depth (1 for first-token nucleus)
@@ -50,7 +49,6 @@ NUCLEI_SCHEMA = pa.schema([
 ROLLOUTS_SCHEMA = pa.schema([
     ("model_id", pa.string()),
     ("unique_id", pa.string()),
-    ("math500_native_id", pa.string()),
     ("subject", pa.string()),
     ("answer", pa.string()),
     ("depth", pa.int8()),

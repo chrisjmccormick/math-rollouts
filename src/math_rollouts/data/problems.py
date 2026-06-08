@@ -123,6 +123,35 @@ def load_math500(*, dataset_id: str = MATH500_DATASET_ID, split: str = "test") -
     return out
 
 
+def _table_problem(r) -> dict:
+    """One problems-table row (itertuples) -> the problem dict generation expects."""
+    return {"unique_id": r.unique_id, "subject": r.subject, "subj": r.subj,
+            "level": int(r.level), "problem": r.problem,
+            "solution": getattr(r, "solution", ""), "answer": r.answer}
+
+
+def load_problems_by_split(split: str, **kw) -> list[dict]:
+    """Problems for one split (``train`` | ``test`` | ``math500``) from the dataset's
+    own ``problems/math_problems.parquet`` (split-aware ``unique_id`` + ``split``).
+    This — not the external HF MATH-500 mirror — is the canonical generation source."""
+    from .hf import load_problems_parquet
+    df = load_problems_parquet("math_problems", **kw)
+    return [_table_problem(r) for r in df[df["split"] == split].itertuples()]
+
+
+def load_problems_by_ids(ids: list[str], **kw) -> list[dict]:
+    """Problems for explicit split-aware ``unique_id``s from ``math_problems.parquet``."""
+    from .hf import load_problems_parquet
+    want = set(ids)
+    df = load_problems_parquet("math_problems", **kw)
+    out = [_table_problem(r) for r in df[df.unique_id.isin(want)].itertuples()]
+    missing = want - {p["unique_id"] for p in out}
+    if missing:
+        print(f"[math_rollouts] warning: {len(missing)} ids not in math_problems "
+              f"(first: {sorted(missing)[:3]})", flush=True)
+    return out
+
+
 def load_math500_by_ids(ids: list[str], *, dataset_id: str = MATH500_DATASET_ID,
                         split: str = "test") -> list[dict]:
     """Fetch a MATH-500 subset by native unique_id."""

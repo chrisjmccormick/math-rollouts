@@ -117,7 +117,6 @@ def _write_shard(path: Path, rows: list[dict], pa_logit) -> None:
     table = pa.table({
         "model_id": col("model_id", pa.string()),
         "unique_id": col("unique_id", pa.string()),
-        "math500_native_id": col("math500_native_id", pa.string()),
         "subject": col("subject", pa.string()),
         "sample_idx": col("sample_idx", pa.int16()),
         "run_id": col("run_id", pa.int32()),
@@ -229,7 +228,6 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                 r = it["row"]
                 rows.append({
                     "model_id": model_id, "unique_id": r["unique_id"],
-                    "math500_native_id": r.get("math500_native_id"),
                     "subject": r.get("subject"),
                     "sample_idx": int(r["sample_idx"]),
                     "run_id": int(r["run_id"]) if r.get("run_id") is not None else None,

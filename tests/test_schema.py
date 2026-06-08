@@ -33,6 +33,13 @@ def test_rollouts_has_no_correctness():
     assert _dtype(ROLLOUTS_SCHEMA, "completion_token_ids") == pa.list_(pa.int32())
 
 
+def test_single_split_aware_id():
+    # The second id is gone; unique_id (split-aware) is the only problem identity.
+    assert "math500_native_id" not in NUCLEI_SCHEMA.names
+    assert "math500_native_id" not in ROLLOUTS_SCHEMA.names
+    assert "unique_id" in NUCLEI_SCHEMA.names and "unique_id" in ROLLOUTS_SCHEMA.names
+
+
 def test_scores_dtypes_and_join_keys():
     assert _dtype(SCORES_SCHEMA, "is_correct") == pa.bool_()
     assert ROLLOUT_KEY == ["model_id", "unique_id", "run_id", "branch_path", "sample_idx"]
@@ -46,8 +53,7 @@ def test_scores_dtypes_and_join_keys():
 
 def test_table_from_rows_coerces_and_fills_missing():
     rows = [{
-        "model_id": "M", "unique_id": "test/geometry/627.json",
-        "math500_native_id": "test/geometry/627.json", "subject": "Geometry",
+        "model_id": "M", "unique_id": "math500/geometry/9467", "subject": "Geometry",
         "answer": "42", "depth": 1, "branch_path": [3],
         "opener_token_ids": [123], "opener_token_strs": ["x"],
         "fork_token_id": 123, "nuc_prob": 0.5, "path_prob": 0.5,

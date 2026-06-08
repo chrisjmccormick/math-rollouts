@@ -29,20 +29,18 @@ def build_nuclei(model, tok, adapter, problems, cfg: GenConfig, *,
     """Phase 1 (HF). Build the nucleus tree per problem and return OPENER rows.
 
     Each row conforms to ``NUCLEI_SCHEMA``: the problem-identity fields
-    (``model_id``, ``unique_id``, ``math500_native_id``, ``subject``, ``answer``,
-    ``is_thinking``) plus the tree-derived opener fields from ``leaf_openers``."""
+    (``model_id``, ``unique_id``, ``subject``, ``answer``, ``is_thinking``) plus
+    the tree-derived opener fields from ``leaf_openers``."""
     tree = NucleusTree(model, tok, adapter, cfg, max_depth=max_depth,
                        max_branch=max_branch, device=device)
     rows: list[dict] = []
     for i, p in enumerate(problems):
         prompt = adapter.prompt_ids(p, tok)
         root = tree.build(prompt)
-        native = p["unique_id"] if str(p["unique_id"]).startswith("test/") else None
         for op in leaf_openers(root, tok):
             rows.append({
                 "model_id": adapter.model_id,
                 "unique_id": p["unique_id"],
-                "math500_native_id": native,
                 "subject": p.get("subject", p["unique_id"].split("/")[1]
                                   if "/" in p["unique_id"] else ""),
                 "answer": p["answer"],
@@ -99,7 +97,6 @@ def force_rollouts(llm, tok, adapter, nuclei_rows, problems, cfg: GenConfig, *,
             rollouts.append({
                 "model_id": adapter.model_id,
                 "unique_id": n["unique_id"],
-                "math500_native_id": n["math500_native_id"],
                 "subject": n["subject"],
                 "answer": n["answer"],
                 "depth": n["depth"],

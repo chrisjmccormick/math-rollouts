@@ -3,7 +3,7 @@
 Layout (repo_type=dataset)::
 
     problems/    math_problems.parquet, math500.parquet
-    mappings/    math500_to_math12k.{json,csv}
+    mappings/    math500_to_hf.csv   (unique_id <-> hf MATH-500 id)
     generations/<model-slug>/<experiment>/
         nuclei.parquet, rollouts.parquet, scores.parquet, policies.csv, manifest.json
 

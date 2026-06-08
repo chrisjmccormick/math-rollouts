@@ -6,12 +6,12 @@ over its naturally-sampled rollouts), bucketed into bands. Ported from the sourc
 generation parquets are resolved through the dataset's ``generations/<slug>/...``
 convention (local snapshot via ``$MATH_ROLLOUTS_DATA`` or the HF hub).
 
-Banding reads the NATURALLY-SAMPLED pools (which carry ``is_correct`` + ``unique_id``
-+ optionally ``math500_native_id``) — e.g. ``math12k_L4_5_K64`` and ``math500_passK``
-— not the opener experiments. A problem present in more than one file is averaged.
+Banding reads the NATURALLY-SAMPLED pools (which carry ``is_correct`` + ``unique_id``)
+— e.g. ``math12k_L4_5_K64`` and ``math500_passK`` — not the opener experiments. A
+problem present in more than one file is averaged.
 
     from math_rollouts.analysis.difficulty import band_for, band_table, BAND_ORDER
-    band_for("Qwen/Qwen2.5-Math-1.5B", "test/geometry/627.json")   # -> "Medium"
+    band_for("Qwen/Qwen2.5-Math-1.5B", "math500/geometry/9467")   # -> "Medium"
 """
 from __future__ import annotations
 
@@ -53,33 +53,18 @@ def _gen_paths(model_id: str, data_root=None):
 def band_table(model: str, data_root: str | None = None):
     """Per-problem difficulty: columns unique_id, n, acc, band.
 
-    Pools rollouts across the model's data files; MATH-500 rows are emitted under
-    BOTH their ``unique_id`` and ``math500_native_id`` so callers can look up by
-    whichever id form they hold."""
+    Pools rollouts across the model's data files and groups by the split-aware
+    ``unique_id`` (e.g. ``math500/geometry/9467``)."""
     import pandas as pd
-    import pyarrow.parquet as pq
 
     if model not in MODEL_DATA:
         raise KeyError(f"no difficulty data registered for {model!r}; known: {sorted(MODEL_DATA)}")
-    frames = []
-    for path in _gen_paths(model, data_root):
-        names = set(pq.read_schema(path).names)
-        want = ["unique_id", "is_correct"] + (["math500_native_id"] if "math500_native_id" in names else [])
-        df = pd.read_parquet(path, columns=want)
-        if "math500_native_id" not in df.columns:
-            df["math500_native_id"] = None
-        frames.append(df)
+    frames = [pd.read_parquet(path, columns=["unique_id", "is_correct"])
+              for path in _gen_paths(model, data_root)]
     allrows = pd.concat(frames, ignore_index=True)
 
-    by_uid = allrows.groupby("unique_id").is_correct.agg(["mean", "size"]).reset_index()
-    by_uid.columns = ["unique_id", "acc", "n"]
-    rows = [by_uid]
-    nat = allrows.dropna(subset=["math500_native_id"])
-    if len(nat):
-        by_nat = nat.groupby("math500_native_id").is_correct.agg(["mean", "size"]).reset_index()
-        by_nat.columns = ["unique_id", "acc", "n"]
-        rows.append(by_nat)
-    out = pd.concat(rows, ignore_index=True).drop_duplicates("unique_id")
+    out = allrows.groupby("unique_id").is_correct.agg(["mean", "size"]).reset_index()
+    out.columns = ["unique_id", "acc", "n"]
     out["band"] = out["acc"].apply(assign_band)
     return out
 
