@@ -24,7 +24,7 @@ uniform-opener forced rollouts. Generation is guidance-free: only naturally-samp
 completions from public checkpoints.
 
 - **Code (generator, adapters, nucleus tree, scorers, analysis):**
-  [github.com/ChrisMcCormick/math-rollouts](https://github.com/ChrisMcCormick/math-rollouts)
+  [github.com/chrisjmccormick/math-rollouts](https://github.com/chrisjmccormick/math-rollouts)
 - **Data (this repo, `repo_type=dataset`):** the parquets/CSVs documented below.
 
 The code/data split keeps git light, lets consumers (e.g. the `nucleus-viz` repo)
@@ -157,7 +157,7 @@ durable opener identity, since a raw fork token id can recur across forks at dep
 
 ## Loading
 
-With the [`math-rollouts`](https://github.com/ChrisMcCormick/math-rollouts) package
+With the [`math-rollouts`](https://github.com/chrisjmccormick/math-rollouts) package
 (`pip install -e .`):
 
 ```python
