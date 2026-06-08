@@ -44,6 +44,18 @@ def experiment_dir(model_id: str, experiment: str) -> str:
     return f"generations/{model_slug(model_id)}/{experiment}"
 
 
+def load_token_nuclei(model_id: str, pool: str, unique_id: str, **kw):
+    """Load one problem's per-token nucleus shard from
+    ``generations/<slug>/<pool>_token_nuclei/<uid-slug>.parquet`` (per-problem
+    sharding, the default). ``unique_id`` ``train/geometry/9467`` ->
+    ``train_geometry_9467.parquet``. Raises if the shard isn't present (the store
+    is produced by ``analysis.token_nuclei`` and may not exist yet)."""
+    import pandas as pd
+    slug = unique_id.replace("/", "_")
+    rel = f"generations/{model_slug(model_id)}/{pool}_token_nuclei/{slug}.parquet"
+    return pd.read_parquet(_resolve(rel, **kw))
+
+
 def load_problems_parquet(name: str = "math_problems", **kw):
     """Load ``problems/<name>.parquet``: ``math_problems`` (the ~12k MATH superset,
     keyed by ``train/<subj>/<n>`` ids) or ``math500`` (the 500-problem subset). Used
