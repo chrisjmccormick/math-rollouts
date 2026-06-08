@@ -1,23 +1,34 @@
-"""Per-token nucleus *sizes* over a whole rollout pool — the data behind the
-"how small are these nuclei / how many are singletons?" statistics.
+"""Per-token nucleus store + size statistics over a rollout pool.
 
 For every rollout in a naturally-sampled pool (e.g. ``math500_passK``) this
-teacher-forces the completion through the model and records, at each generated
-position, the **nucleus size** (how many tokens survive the top-k cap + top-p
-keep, the set sampling could actually have drawn from) and whether the token the
-rollout took was the model's top-1. It does NOT store the nucleus members by
-default — only the per-position size — which is all the size/singleton
-statistics need and keeps the output small. (Reachability work that needs the
-members can add a members table later; see ``nucleus/trace.py``.)
+teacher-forces the completion through the model and, at each generated position,
+records the **nucleus size** plus a compact, frugal slice of the distribution:
 
-The nucleus rule is the project's single source of truth (``nucleus.recipe``):
-softmax(logits/T), keep top-k by prob, keep the minimal top-p set (always the top
-token). Recompute precision is **bfloat16**, matching the vLLM generation engine —
-some first-token logits are nearly tied, so fp32 would reshuffle the nucleus.
+  * **singletons** (nucleus size 1): keep the top-2 tokens — enough to see whether
+    the runner-up had any meaningful mass (a near-miss singleton), without the cost
+    of a full distribution. Regenerate to investigate further.
+  * **branches** (size >= 2): keep ``min(max(size, 10), 20)`` tokens — at least 10,
+    so the visualization can show alternates just *outside* the nucleus and a
+    reachability check can tell "outside the nucleus but barely" from "far down";
+    capped at ``top_k`` = 20 (the nucleus can never exceed that anyway).
 
-Output (under ``<out_dir>/generations/<model-slug>/``):
-  <pool>_token_nuclei.parquet   one row per rollout; per-token lists
-  <pool>_nuclei_stats.json      aggregate summary (the blog numbers)
+Stored per kept entry: the **raw logit** (pre-temperature — recompute any T/prob)
+and the token **id**. Recompute precision is **bfloat16**, matching the vLLM engine
+that generated the rollouts; that, plus the engine, is stamped in ``_meta.json`` so
+the "just outside the nucleus" comparison is only ever made between like-precision
+logits.
+
+Output (sharded per problem by default — small files the viz can load one at a
+time; use ``shard_size`` > 1 to bucket, e.g. for the larger math12k pools)::
+
+    <out_dir>/generations/<model-slug>/<pool>_token_nuclei/
+        <shard>.parquet ...   per-rollout rows; see _write_shard for the columns
+        _stats.json           aggregate size statistics (the blog numbers)
+        _meta.json            model / engine / dtype / config / keep-rule
+
+Per row the kept entries are stored FLAT (``kept_ids`` / ``kept_logits``) with a
+parallel ``keep_counts`` so they can be re-split per position without a list-of-
+lists column; see ``unpack_kept``.
 """
 from __future__ import annotations
 
@@ -29,45 +40,68 @@ from typing import Any
 from ..config import GenConfig
 from ..data.hf import load_generation_parquet, load_problems_parquet, model_slug
 
+# Keep-rule (also written to _meta.json). Branch max is top_k (cfg), since the
+# nucleus can never exceed it.
+SINGLETON_KEEP = 2
+BRANCH_MIN = 10
 
-def _sequence_nucleus_stats(gen_logits, chosen_ids, *, temperature, top_p, top_k,
-                            pos_chunk: int = 1024):
-    """Vectorized per-position nucleus size + top-1 flag for one sequence.
 
-    ``gen_logits`` [T, V] are the logits predicting each completion token;
-    ``chosen_ids`` [T] are those tokens. Returns ``(sizes, is_top1)`` numpy arrays.
-    Chunked over positions to bound the float32 working set.
+def _sequence_kept(gen_logits, chosen_ids, *, temperature, top_p, top_k,
+                   pos_chunk: int = 512):
+    """Vectorized per-position nucleus + frugal kept slice for one sequence.
+
+    ``gen_logits`` [T, V] predict each completion token; ``chosen_ids`` [T] are
+    those tokens. Returns numpy arrays ``(sizes, is_top1, keep_counts,
+    kept_ids_flat, kept_logits_flat)``; the flat arrays concatenate each position's
+    kept entries (position-major, rank order) and split on ``keep_counts``.
     """
     import torch
 
-    sizes, top1s = [], []
-    T = gen_logits.shape[0]
-    for s in range(0, T, pos_chunk):
+    sizes_l, top1_l, keepn_l, ids_l, logit_l = [], [], [], [], []
+    for s in range(0, gen_logits.shape[0], pos_chunk):
         gl = gen_logits[s:s + pos_chunk].float()
         ch = chosen_ids[s:s + pos_chunk]
-        scaled = gl / temperature
-        lse = torch.logsumexp(scaled, dim=-1, keepdim=True)
-        top_logit, top_idx = torch.topk(scaled, top_k, dim=-1)       # [t, k] desc
-        top_prob = torch.exp(top_logit - lse)                         # normalized
+        lse = torch.logsumexp(gl / temperature, dim=-1, keepdim=True)
+        # topk on raw logits == topk on scaled (monotonic); store the RAW logit.
+        top_raw, top_idx = torch.topk(gl, top_k, dim=-1)
+        top_prob = torch.exp(top_raw / temperature - lse)
         csum = torch.cumsum(top_prob, dim=-1)
         keep = (csum - top_prob) < top_p
         keep[:, 0] = True
-        sizes.append(keep.sum(dim=-1).to(torch.int16))
-        top1s.append(top_idx[:, 0] == ch)
-    return (torch.cat(sizes).cpu().numpy(), torch.cat(top1s).cpu().numpy())
+        size = keep.sum(dim=-1)                                   # [t], 1..top_k
+        keep_n = torch.where(size <= 1, torch.full_like(size, SINGLETON_KEEP),
+                             torch.clamp(size, min=BRANCH_MIN))    # max already <= top_k
+        store = torch.arange(top_k, device=gl.device).unsqueeze(0) < keep_n.unsqueeze(1)
+        sizes_l.append(size.to(torch.int16))
+        top1_l.append(top_idx[:, 0] == ch)
+        keepn_l.append(keep_n.to(torch.int16))
+        ids_l.append(top_idx[store])
+        logit_l.append(top_raw[store])
+    return (torch.cat(sizes_l).cpu().numpy(), torch.cat(top1_l).cpu().numpy(),
+            torch.cat(keepn_l).cpu().numpy(), torch.cat(ids_l).cpu().numpy(),
+            torch.cat(logit_l).float().cpu().numpy())
+
+
+def unpack_kept(row) -> list[tuple[list[int], list[float]]]:
+    """Re-split a stored row's flat ``kept_ids``/``kept_logits`` into one
+    ``(ids, logits)`` pair per generated position, using ``keep_counts``."""
+    ids, logits, counts = row["kept_ids"], row["kept_logits"], row["keep_counts"]
+    out, off = [], 0
+    for c in counts:
+        c = int(c)
+        out.append((list(ids[off:off + c]), list(logits[off:off + c])))
+        off += c
+    return out
 
 
 def _pack_batches(items, max_batch_tokens: int):
-    """Greedily pack length-sorted items into padded batches whose padded cost
-    (n * max_len) stays under ``max_batch_tokens`` — keeps long rollouts in small
-    batches and short ones in big batches."""
+    """Greedily pack length-sorted items into padded batches under a token budget."""
     batches, cur, cur_max = [], [], 0
     for it in items:
-        L = it["seq_len"]
-        new_max = max(cur_max, L)
+        new_max = max(cur_max, it["seq_len"])
         if cur and (len(cur) + 1) * new_max > max_batch_tokens:
             batches.append(cur)
-            cur, cur_max, new_max = [], 0, L
+            cur, cur_max, new_max = [], 0, it["seq_len"]
         cur.append(it)
         cur_max = new_max
     if cur:
@@ -75,11 +109,45 @@ def _pack_batches(items, max_batch_tokens: int):
     return batches
 
 
-def iter_rollout_records(model_id: str, pool: str, *, limit: int | None = None,
-                         max_batch_tokens: int = 24000, device: str = "cuda",
-                         progress_every: int = 200):
-    """Teacher-force every rollout in ``pool`` and yield one record per rollout:
-    identity fields + ``nuc_sizes`` / ``chosen_is_top1`` per-completion-token lists."""
+def _write_shard(path: Path, rows: list[dict], pa_logit) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    col = lambda k, t: pa.array([r[k] for r in rows], type=t)
+    table = pa.table({
+        "model_id": col("model_id", pa.string()),
+        "unique_id": col("unique_id", pa.string()),
+        "math500_native_id": col("math500_native_id", pa.string()),
+        "subject": col("subject", pa.string()),
+        "sample_idx": col("sample_idx", pa.int16()),
+        "run_id": col("run_id", pa.int32()),
+        "is_correct": col("is_correct", pa.bool_()),
+        "n_tokens": col("n_tokens", pa.int32()),
+        "nuc_sizes": col("nuc_sizes", pa.list_(pa.int16())),
+        "chosen_is_top1": col("chosen_is_top1", pa.list_(pa.bool_())),
+        "keep_counts": col("keep_counts", pa.list_(pa.int16())),
+        "kept_ids": col("kept_ids", pa.list_(pa.int32())),
+        "kept_logits": col("kept_logits", pa.list_(pa_logit)),
+    })
+    pq.write_table(table, path, compression="zstd")
+
+
+def _percentile_from_counts(counts, q):
+    import numpy as np
+    total = counts.sum()
+    target = q / 100.0 * total
+    cum = np.cumsum(counts)
+    return int(np.searchsorted(cum, target))
+
+
+def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
+                       limit: int | None = None, shard_size: int = 1,
+                       max_batch_tokens: int = 24000, device: str = "cuda",
+                       logit_dtype: str = "float16", progress_every: int = 50):
+    """Compute the per-token nucleus store for ``pool`` and write sharded parquets +
+    ``_stats.json`` + ``_meta.json``. Returns ``(stats, paths)``."""
+    import numpy as np
+    import pyarrow as pa
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -90,14 +158,11 @@ def iter_rollout_records(model_id: str, pool: str, *, limit: int | None = None,
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
-
     print(f"Loading {model_id} on {device} (bfloat16) ...", flush=True)
-    # torch_dtype (not dtype) for compatibility across transformers versions: it is
-    # accepted by both old and new releases; the newest only warns.
     model = AutoModelForCausalLM.from_pretrained(
         model_id, torch_dtype=torch.bfloat16, trust_remote_code=True,
-        low_cpu_mem_usage=True,
-    ).to(device).eval()
+        low_cpu_mem_usage=True).to(device).eval()
+    pa_logit = {"float32": pa.float32(), "float16": pa.float16()}[logit_dtype]
 
     pool_df = load_generation_parquet(model_id, pool)
     if limit is not None:
@@ -105,9 +170,10 @@ def iter_rollout_records(model_id: str, pool: str, *, limit: int | None = None,
     prob_text = dict(zip(*[load_problems_parquet("math_problems")[c]
                            for c in ("unique_id", "problem")]))
 
-    # Build the work list (cache prompt ids per problem; they repeat across samples).
+    # Group rollouts by problem; cache the (repeated) prompt per problem.
+    by_problem: dict[str, list] = {}
     prompt_cache: dict[str, list[int]] = {}
-    items, missing = [], 0
+    missing = 0
     for r in pool_df.to_dict("records"):
         uid = r["unique_id"]
         if uid not in prob_text:
@@ -116,91 +182,118 @@ def iter_rollout_records(model_id: str, pool: str, *, limit: int | None = None,
         if uid not in prompt_cache:
             prompt_cache[uid] = adapter.prompt_ids({"problem": prob_text[uid]}, tok)
         comp = [int(t) for t in r["completion_token_ids"]]
-        if not comp:
-            continue
-        items.append({"row": r, "prompt": prompt_cache[uid], "comp": comp,
-                      "seq_len": len(prompt_cache[uid]) + len(comp)})
+        if comp:
+            by_problem.setdefault(uid, []).append((r, comp))
     if missing:
         print(f"WARNING: {missing} rollouts skipped (unique_id not in problems table)",
               flush=True)
-    items.sort(key=lambda x: x["seq_len"])
-    batches = _pack_batches(items, max_batch_tokens)
-    print(f"{len(items)} rollouts in {len(batches)} batches "
-          f"(<= {max_batch_tokens} padded tokens each)", flush=True)
+    problems = sorted(by_problem, key=lambda u: (by_problem[u][0][0].get("subject") or "", u))
+    n_roll = sum(len(v) for v in by_problem.values())
+    print(f"{len(problems)} problems, {n_roll} rollouts -> shards of {shard_size} "
+          f"problem(s)", flush=True)
 
-    done, next_mark = 0, progress_every
-    for batch in batches:
-        bmax = max(it["seq_len"] for it in batch)
-        input_ids = torch.full((len(batch), bmax), tok.pad_token_id, dtype=torch.long)
-        attn = torch.zeros((len(batch), bmax), dtype=torch.long)
-        for i, it in enumerate(batch):
-            seq = it["prompt"] + it["comp"]
-            input_ids[i, :len(seq)] = torch.tensor(seq)
-            attn[i, :len(seq)] = 1
-        input_ids, attn = input_ids.to(device), attn.to(device)
-        with torch.no_grad():
-            logits = model(input_ids=input_ids, attention_mask=attn).logits
-        for i, it in enumerate(batch):
-            plen, T = len(it["prompt"]), len(it["comp"])
-            gen_logits = logits[i, plen - 1:plen - 1 + T]
-            chosen = input_ids[i, plen:plen + T]
-            sizes, top1 = _sequence_nucleus_stats(
-                gen_logits, chosen, temperature=cfg.temperature,
-                top_p=cfg.top_p, top_k=cfg.top_k)
-            r = it["row"]
-            yield {
-                "model_id": model_id,
-                "unique_id": r["unique_id"],
-                "math500_native_id": r.get("math500_native_id"),
-                "subject": r.get("subject"),
-                "level": int(r["level"]) if r.get("level") is not None else None,
-                "sample_idx": int(r["sample_idx"]),
-                "run_id": int(r["run_id"]) if r.get("run_id") is not None else None,
-                "is_correct": bool(r["is_correct"]),
-                "n_tokens": T,
-                "nuc_sizes": sizes.astype("int16").tolist(),
-                "chosen_is_top1": top1.astype(bool).tolist(),
-            }
-        del logits
-        done += len(batch)
-        if progress_every and done >= next_mark:
-            print(f"  {done}/{len(items)} rollouts", flush=True)
-            next_mark += progress_every
+    slug = model_slug(model_id)
+    shard_dir = Path(out_dir) / "generations" / slug / f"{pool}_token_nuclei"
+    shard_dir.mkdir(parents=True, exist_ok=True)
 
+    K = cfg.top_k
+    size_counts = np.zeros(K + 1, dtype=np.int64)
+    first_counts = np.zeros(K + 1, dtype=np.int64)
+    corr_counts = np.zeros(K + 1, dtype=np.int64)
+    incorr_counts = np.zeros(K + 1, dtype=np.int64)
+    n_tokens = n_top1 = n_done = problems_done = 0
 
-def summarize(records: list[dict[str, Any]]) -> dict[str, Any]:
-    """Aggregate the per-rollout records into the headline statistics."""
-    import numpy as np
+    for shard_idx, start in enumerate(range(0, len(problems), shard_size)):
+        chunk_uids = problems[start:start + shard_size]
+        items = [{"row": r, "prompt": prompt_cache[uid], "comp": comp,
+                  "seq_len": len(prompt_cache[uid]) + len(comp)}
+                 for uid in chunk_uids for r, comp in by_problem[uid]]
+        items.sort(key=lambda x: x["seq_len"])
+        rows: list[dict] = []
+        for batch in _pack_batches(items, max_batch_tokens):
+            bmax = max(it["seq_len"] for it in batch)
+            input_ids = torch.full((len(batch), bmax), tok.pad_token_id, dtype=torch.long)
+            attn = torch.zeros((len(batch), bmax), dtype=torch.long)
+            for i, it in enumerate(batch):
+                seq = it["prompt"] + it["comp"]
+                input_ids[i, :len(seq)] = torch.tensor(seq)
+                attn[i, :len(seq)] = 1
+            input_ids, attn = input_ids.to(device), attn.to(device)
+            with torch.no_grad():
+                logits = model(input_ids=input_ids, attention_mask=attn).logits
+            for i, it in enumerate(batch):
+                plen, T = len(it["prompt"]), len(it["comp"])
+                sizes, top1, keepn, ids_flat, logit_flat = _sequence_kept(
+                    logits[i, plen - 1:plen - 1 + T], input_ids[i, plen:plen + T],
+                    temperature=cfg.temperature, top_p=cfg.top_p, top_k=K)
+                r = it["row"]
+                rows.append({
+                    "model_id": model_id, "unique_id": r["unique_id"],
+                    "math500_native_id": r.get("math500_native_id"),
+                    "subject": r.get("subject"),
+                    "sample_idx": int(r["sample_idx"]),
+                    "run_id": int(r["run_id"]) if r.get("run_id") is not None else None,
+                    "is_correct": bool(r["is_correct"]), "n_tokens": int(T),
+                    "nuc_sizes": sizes.astype("int16").tolist(),
+                    "chosen_is_top1": top1.astype(bool).tolist(),
+                    "keep_counts": keepn.astype("int16").tolist(),
+                    "kept_ids": ids_flat.astype("int32").tolist(),
+                    "kept_logits": logit_flat.tolist(),
+                })
+                bc = np.bincount(sizes, minlength=K + 1)[:K + 1]
+                size_counts += bc
+                first_counts[int(sizes[0])] += 1
+                if r["is_correct"]:
+                    corr_counts += bc
+                else:
+                    incorr_counts += bc
+                n_tokens += T
+                n_top1 += int(top1.sum())
+                n_done += 1
+            del logits
+        name = (chunk_uids[0].replace("/", "_") + ".parquet") if shard_size == 1 \
+            else f"shard-{shard_idx:05d}.parquet"
+        _write_shard(shard_dir / name, rows, pa_logit)
+        problems_done += len(chunk_uids)
+        if progress_every and problems_done % progress_every < shard_size:
+            print(f"  {problems_done}/{len(problems)} problems, {n_done}/{n_roll} rollouts",
+                  flush=True)
 
-    sizes, first_sizes, top1, corr_sizes, incorr_sizes = [], [], [], [], []
-    for r in records:
-        s = r["nuc_sizes"]
-        sizes.extend(s)
-        if s:
-            first_sizes.append(s[0])
-        top1.extend(r["chosen_is_top1"])
-        (corr_sizes if r["is_correct"] else incorr_sizes).extend(s)
-
-    a = np.asarray(sizes)
-    fa = np.asarray(first_sizes)
-    vals, counts = np.unique(a, return_counts=True)
-    frac1 = lambda x: float(np.mean(np.asarray(x) == 1)) if len(x) else float("nan")
-    return {
-        "n_rollouts": len(records),
-        "n_tokens": int(a.size),
-        "singleton_count": int((a == 1).sum()),
-        "singleton_frac": float((a == 1).mean()),
-        "mean_size": float(a.mean()),
-        "median_size": float(np.median(a)),
-        "p90_size": float(np.percentile(a, 90)),
-        "max_size": int(a.max()),
-        "chosen_is_top1_frac": float(np.mean(top1)),
-        "size_histogram": {int(k): int(v) for k, v in zip(vals, counts)},
-        "first_token_mean_size": float(fa.mean()),
-        "first_token_singleton_frac": frac1(fa),
-        "singleton_frac_correct": frac1(corr_sizes),
-        "singleton_frac_incorrect": frac1(incorr_sizes),
+    ramp = np.arange(K + 1)
+    frac1 = lambda c: float(c[1] / c.sum()) if c.sum() else float("nan")
+    stats = {
+        "n_rollouts": n_done,
+        "n_tokens": n_tokens,
+        "singleton_count": int(size_counts[1]),
+        "singleton_frac": float(size_counts[1] / n_tokens),
+        "mean_size": float((ramp * size_counts).sum() / n_tokens),
+        "median_size": _percentile_from_counts(size_counts, 50),
+        "p90_size": _percentile_from_counts(size_counts, 90),
+        "chosen_is_top1_frac": float(n_top1 / n_tokens),
+        "size_histogram": {int(k): int(v) for k, v in enumerate(size_counts) if v},
+        "first_token_mean_size": float((ramp * first_counts).sum() / first_counts.sum()),
+        "first_token_singleton_frac": frac1(first_counts),
+        "singleton_frac_correct": frac1(corr_counts),
+        "singleton_frac_incorrect": frac1(incorr_counts),
     }
+    meta = {
+        "model_id": model_id, "pool": pool,
+        "engine": "hf-teacher-forced", "dtype": "bfloat16",
+        "logits": "raw (pre-temperature)", "logit_storage_dtype": logit_dtype,
+        "temperature": cfg.temperature, "top_p": cfg.top_p, "top_k": K,
+        "keep_rule": {"singleton_keep": SINGLETON_KEEP, "branch_min": BRANCH_MIN,
+                      "branch_max": K},
+        "n_rollouts": n_done, "n_problems": len(problems), "shard_size": shard_size,
+        "columns": "kept_ids/kept_logits are FLAT, split per position on keep_counts "
+                   "(see math_rollouts.analysis.token_nuclei.unpack_kept)",
+    }
+    (shard_dir / "_stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    (shard_dir / "_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    _print_summary(stats, pool, model_id)
+    print(f"\nwrote {len(range(0, len(problems), shard_size))} shards + _stats.json + "
+          f"_meta.json to {shard_dir}", flush=True)
+    return stats, {"dir": shard_dir, "stats": shard_dir / "_stats.json",
+                   "meta": shard_dir / "_meta.json"}
 
 
 def _print_summary(stats: dict, pool: str, model_id: str) -> None:
@@ -209,8 +302,8 @@ def _print_summary(stats: dict, pool: str, model_id: str) -> None:
     print(f"  rollouts: {stats['n_rollouts']:,}   tokens: {stats['n_tokens']:,}")
     print(f"  SINGLETON nuclei: {stats['singleton_frac']*100:.1f}% "
           f"({stats['singleton_count']:,} / {stats['n_tokens']:,})")
-    print(f"  mean size {stats['mean_size']:.3f}   median {stats['median_size']:.0f}   "
-          f"p90 {stats['p90_size']:.0f}   max {stats['max_size']}")
+    print(f"  mean size {stats['mean_size']:.3f}   median {stats['median_size']}   "
+          f"p90 {stats['p90_size']}")
     print(f"  chose top-1 token: {stats['chosen_is_top1_frac']*100:.1f}% of positions")
     print(f"  first response token: mean size {stats['first_token_mean_size']:.2f}, "
           f"singleton {stats['first_token_singleton_frac']*100:.1f}%")
@@ -220,45 +313,23 @@ def _print_summary(stats: dict, pool: str, model_id: str) -> None:
     print("  size histogram:", "  ".join(f"{k}:{v/stats['n_tokens']*100:.1f}%" for k, v in top))
 
 
-def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
-                       limit: int | None = None, max_batch_tokens: int = 24000,
-                       device: str = "cuda", progress_every: int = 2000):
-    """Compute per-token nucleus sizes for ``pool``, write the parquet + stats json
-    under ``out_dir/generations/<slug>/``, and return ``(df, stats, paths)``."""
-    import pandas as pd
-
-    records = list(iter_rollout_records(
-        model_id, pool, limit=limit, max_batch_tokens=max_batch_tokens,
-        device=device, progress_every=progress_every))
-    stats = summarize(records)
-    _print_summary(stats, pool, model_id)
-
-    base = Path(out_dir) / "generations" / model_slug(model_id)
-    base.mkdir(parents=True, exist_ok=True)
-    pq = base / f"{pool}_token_nuclei.parquet"
-    sj = base / f"{pool}_nuclei_stats.json"
-    df = pd.DataFrame(records)
-    df.to_parquet(pq, index=False)
-    sj.write_text(json.dumps(stats, indent=2), encoding="utf-8")
-    print(f"\nwrote {pq}\nwrote {sj}", flush=True)
-    return df, stats, {"parquet": pq, "stats": sj}
-
-
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="Qwen/Qwen2.5-Math-1.5B", dest="model_id")
-    ap.add_argument("--pool", default="math500_passK",
-                    help="standalone pool name under generations/<slug>/ (default: math500_passK)")
-    ap.add_argument("--out-root", default=".",
-                    help="local dataset root (output -> generations/<slug>/...)")
-    ap.add_argument("--limit", type=int, default=None,
-                    help="only process the first N rollouts (a few thousand already "
-                         "pins the singleton fraction tightly)")
+    ap.add_argument("--pool", default="math500_passK")
+    ap.add_argument("--out-root", default=".")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--shard-size", type=int, default=1,
+                    help="problems per shard (1 = per-problem; raise for math12k pools)")
+    ap.add_argument("--logit-dtype", default="float16", choices=["float16", "float32"],
+                    help="float16 (default) matches the bf16 compute precision and halves "
+                         "the logit bytes; use float32 if your pyarrow can't write float16")
     ap.add_argument("--max-batch-tokens", type=int, default=24000)
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     build_token_nuclei(a.model_id, a.pool, a.out_root, limit=a.limit,
+                       shard_size=a.shard_size, logit_dtype=a.logit_dtype,
                        max_batch_tokens=a.max_batch_tokens, device=a.device)
 
 
