@@ -1,10 +1,10 @@
 """Unified nucleus/branch tree (anytree-backed), the single code path for both
 thinking and non-thinking models.
 
-A node represents ONE chosen fork token. The (virtual) root sits at the prompt
+A node represents ONE chosen branch token. The (virtual) root sits at the prompt
 position supplied by the model adapter; its nucleus is the first-token nucleus, and
 its children are the nucleus members (depth 1). Expanding a child advances one
-token and forks again, to ``max_depth``. ``max_depth=1`` therefore reproduces the
+token and branches again, to ``max_depth``. ``max_depth=1`` therefore reproduces the
 classic first-token nucleus exactly: one single-token opener per nucleus member —
 byte-parity with the legacy ``openings_k16`` recipe.
 
@@ -13,7 +13,7 @@ Efficiency: ONE persistent ``DynamicCache`` walked DFS with single-token forward
 
 The nucleus is the model adapter's notion of the root position (e.g. the first
 reasoning token after a forced ``<think>\\n`` for thinking models); terminal tokens
-(EOS, ``</think>``) come from the adapter, so a terminal fork member becomes a
+(EOS, ``</think>``) come from the adapter, so a terminal branch member becomes a
 terminal leaf with no expansion. Nothing here branches on model family.
 """
 from __future__ import annotations
@@ -74,7 +74,7 @@ class NucleusTree:
         return node
 
     def _expand(self, node, logits, depth):
-        """Fork ``node`` (whose logits are known) into its nucleus children, recurse
+        """Branch ``node`` (whose logits are known) into its nucleus children, recurse
         to max_depth. Cache is positioned at ``node`` on entry and restored on exit."""
         ids, probs = self._nucleus(logits)
         node.nuc_ids, node.nuc_probs = ids, probs
