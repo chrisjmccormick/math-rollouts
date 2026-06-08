@@ -35,6 +35,7 @@ math-rollouts-generate = "math_rollouts.generate.run:main"
 math-rollouts-score = "math_rollouts.score.run:main"
 math-rollouts-policies = "math_rollouts.analysis.policies:main"
 math-rollouts-bandtable = "math_rollouts.analysis.bandtable:main"
+math-rollouts-token-nuclei = "math_rollouts.analysis.token_nuclei:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

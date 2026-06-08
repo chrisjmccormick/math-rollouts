@@ -44,6 +44,16 @@ def experiment_dir(model_id: str, experiment: str) -> str:
     return f"generations/{model_slug(model_id)}/{experiment}"
 
 
+def load_problems_parquet(name: str = "math_problems", **kw):
+    """Load ``problems/<name>.parquet``: ``math_problems`` (the ~12k MATH superset,
+    keyed by ``train/<subj>/<n>`` ids) or ``math500`` (the 500-problem subset). Used
+    to recover problem text for prompt reconstruction. Suffix optional."""
+    import pandas as pd
+    if not name.endswith(".parquet"):
+        name += ".parquet"
+    return pd.read_parquet(_resolve(f"problems/{name}", **kw))
+
+
 def load_generation_parquet(model_id: str, name: str, **kw):
     """Load a standalone ``generations/<model-slug>/<name>.parquet`` (not part of an
     experiment dir), e.g. ``name="math500_passK"`` — the naturally-sampled rollout
