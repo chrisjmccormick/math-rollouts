@@ -51,13 +51,16 @@ Problem identity is a single split-aware `unique_id = <split>/<subj>/<n>` with
 - **Model differences live in one ABC.** `adapters/base.py:ModelAdapter` captures the
   only thinking/non-thinking differences (prompt, terminals, scoring, vLLM stops).
   Adding a model = one subclass + one registry line — no schema or generator change.
-- **Generation and scoring are separated.** Generation writes pristine RAW rollouts
-  (GPU); scoring (`score/run.py`, CPU) writes `scores.parquet` under a versioned
-  `scorer_id`, so accuracy can be recomputed under a different scorer without
-  regenerating.
+- **Facts, not a baked verdict.** Rollouts/pools store criterion-free attributes
+  (`answer_matches`, `has_boxed`, termination, lengths, answer placement) — never an
+  `is_correct` boolean. A **named scorer** (`score/run.py`, CPU) maps those facts to a
+  verdict under a versioned `scorer_id` (`answer-match` default, `boxed-match`,
+  `benchmark@budget=B`, `leak-filtered@keep_frac`), so accuracy is always reproduced
+  from a scorer + params, never read off a stored boolean. See [SCORING.md](SCORING.md).
 - **Grouping is explicit.** The group key is `(model_id, unique_id, branch_path,
-  run_id)`; `accuracy = Σ is_correct / group_size` (row count, never a stored count).
-  `branch_path` (child-index at each fork) is the durable opener identity.
+  run_id)`; `accuracy = Σ answer_matches / group_size` (the default `answer-match`
+  verdict; row count, never a stored count). `branch_path` (child-index at each fork)
+  is the durable opener identity.
 
 ## Install
 
@@ -80,8 +83,8 @@ math-rollouts-generate --model Qwen/Qwen2.5-Math-1.5B \
 # ...or the canonical first-job recipe, with its parameters baked in:
 python scripts/math500_uniform_k16.py --out-root <data-root>
 
-# Score (CPU, re-runnable under any scorer_id)
-math-rollouts-score --rollouts <data-root>/generations/<slug>/<exp>/rollouts.parquet
+# Score (CPU, re-runnable under any scorer_id; default answer-match)
+math-rollouts-score --rollouts <data-root>/generations/<slug>/<exp>/rollouts.parquet --scorer answer-match
 
 # Analysis
 math-rollouts-policies   --exp-dir <data-root>/generations/<slug>/<exp>   # opener-policy accuracy
@@ -104,8 +107,9 @@ cells; convert with your `.md`↔`.ipynb` utility or run as a plain script), in 
    stats, per-difficulty, position, correct/incorrect).
 
 One-off migration of the legacy pools to `POOL_SCHEMA`:
-`python scripts/migrate_pools.py --out-root <dir>` (CPU; re-scores `is_correct`,
-writes a reviewable copy + drift report, then upload).
+`python scripts/migrate_pools.py --out-root <dir>` (CPU; derives the criterion-free
+attributes incl. `answer_matches` + `dup_index`, writes a reviewable copy + drift
+report, then upload).
 
 ## Loading data
 

@@ -212,8 +212,10 @@ def migrate_legacy_pool(legacy_df, *, model_id: str | None = None, tok=None,
     rows = legacy_df.to_dict("records")
     for r in rows:
         r.setdefault("depth", 0)
-        r["branch_path"] = list(r.get("branch_path") or [])
-        r["opener_token_ids"] = list(r.get("opener_token_ids") or [])
+        bp, op = r.get("branch_path"), r.get("opener_token_ids")
+        # explicit None-checks: empty numpy arrays are ambiguous under `or`.
+        r["branch_path"] = list(bp) if bp is not None else []
+        r["opener_token_ids"] = list(op) if op is not None else []
     annotated = compute_raw_attributes(rows, tok=tok, prompt_len=prompt_len, eos_id=eos_id)
     df = table_from_rows(annotated, POOL_SCHEMA).to_pandas()
     if "dup_index" in legacy_df.columns:
