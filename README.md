@@ -91,9 +91,21 @@ math-rollouts-token-nuclei --pool math500_passK --out-root <data-root>    # per-
 
 GPU phases must run in the project env (`source ~/env.sh`).
 
-**Notebook.** `notebooks/calculate_token_nuclei.md` runs the per-token nucleus job on a
-Colab GPU and pushes the store back to the dataset (it's a markdown-form notebook;
-convert it with your `.md`↔`.ipynb` utility, or run it as a plain script).
+**Notebooks.** `notebooks/` holds markdown-form notebooks (`<!-- code/md/output -->`
+cells; convert with your `.md`↔`.ipynb` utility or run as a plain script), in order:
+
+1. `01 - Generate Rollouts` — natural-sample K rollouts per problem on a Colab GPU,
+   score them, and push self-contained pools (`generations/<slug>/<pool>.parquet`,
+   `POOL_SCHEMA`) to the dataset; includes a width-extend example (top a pool up to
+   ≥K per problem).
+2. `02 - Compute Nuclei for Rollouts` — teacher-force a pool to build the per-token
+   nucleus store (GPU).
+3. `03 - Analyze Rollout Nuclei` — CPU analysis of the nucleus store (even-K size
+   stats, per-difficulty, position, correct/incorrect).
+
+One-off migration of the legacy pools to `POOL_SCHEMA`:
+`python scripts/migrate_pools.py --out-root <dir>` (CPU; re-scores `is_correct`,
+writes a reviewable copy + drift report, then upload).
 
 ## Loading data
 

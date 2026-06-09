@@ -20,15 +20,16 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 class GenConfig:
     """Sampling + nucleus config, fixed across the project's canonical runs.
 
-    The same ``temperature``/``top_p``/``top_k`` define BOTH the nucleus (the
-    first-token / branch fan-out, computed on temperature-scaled probs and capped
-    at ``top_k``) and the forced rollouts sampled through each opener.
+    Rollouts are sampled with ``temperature`` + ``top_p`` only. ``top_k`` does NOT
+    limit generation — it caps the **nucleus** fan-out (the first-token / branch
+    set, computed on temperature-scaled probs, capped at ``top_k``) and the size of
+    the post-hoc per-token nucleus store (``analysis.token_nuclei``).
     """
 
     temperature: float = 0.6
     top_p: float = 0.95
-    top_k: int = 20          # cap on nucleus size (TOPK)
-    max_tokens: int = 3000   # max generated tokens per forced rollout
+    top_k: int = 20          # nucleus-size cap ONLY (not a sampling limiter)
+    max_tokens: int = 3000   # max generated tokens per rollout
     max_model_len: int = 4096
 
     def gen_config_id(self) -> int:

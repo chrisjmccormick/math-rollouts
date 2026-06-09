@@ -56,6 +56,37 @@ def load_token_nuclei(model_id: str, pool: str, unique_id: str, **kw):
     return pd.read_parquet(_resolve(rel, **kw))
 
 
+def load_token_nuclei_pool(model_id: str, pool: str, *, columns: list[str] | None = None,
+                           local_root: str | Path | None = None,
+                           repo_id: str = DATASET_REPO, revision: str | None = None):
+    """Load and concatenate ALL per-problem nucleus shards for ``pool`` into one
+    DataFrame (the bulk counterpart to ``load_token_nuclei``, which reads a single
+    problem). Resolves a local snapshot (``local_root`` or ``$MATH_ROLLOUTS_DATA``)
+    if present, else pulls just the ``<pool>_token_nuclei/*.parquet`` shards from the
+    hub via ``snapshot_download``.
+
+    ``columns`` is forwarded to ``read_parquet`` — pass the light columns (e.g.
+    ``["unique_id", "is_correct", "nuc_sizes", "chosen_is_top1"]``) to skip the bulky
+    ``kept_ids``/``kept_logits`` lists when you only need size statistics."""
+    import pandas as pd
+
+    rel_dir = f"generations/{model_slug(model_id)}/{pool}_token_nuclei"
+    root = local_root or os.environ.get("MATH_ROLLOUTS_DATA")
+    shard_dir = None
+    if root and (Path(root) / rel_dir).is_dir():
+        shard_dir = Path(root) / rel_dir
+    else:
+        from huggingface_hub import snapshot_download
+        snap = snapshot_download(repo_id=repo_id, repo_type="dataset", revision=revision,
+                                 allow_patterns=f"{rel_dir}/*.parquet")
+        shard_dir = Path(snap) / rel_dir
+    shards = sorted(shard_dir.glob("*.parquet"))
+    if not shards:
+        raise FileNotFoundError(f"no nucleus shards under {shard_dir}")
+    return pd.concat([pd.read_parquet(p, columns=columns) for p in shards],
+                     ignore_index=True)
+
+
 def load_problems_parquet(name: str = "math_problems", **kw):
     """Load ``problems/<name>.parquet``: ``math_problems`` (the ~12k MATH superset,
     keyed by ``train/<subj>/<n>`` ids) or ``math500`` (the 500-problem subset). Used

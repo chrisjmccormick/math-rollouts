@@ -122,9 +122,12 @@ pip_url = f"git+https://{_auth}github.com/{GH_OWNER}/math-rollouts.git"
 <!-- md -->
 ## Configure
 
-- `POOL` — which naturally-sampled pool to analyze. `math500_passK` (~40k
-  rollouts over the 500 MATH-500 problems) is a good default; `math12k_passK`
-  (~130k) gives a tighter estimate but takes longer.
+- `POOL` — which naturally-sampled pool to analyze. 
+    - `math12k_L4_5_K64` (64
+  rollouts per problem, uniform across all difficulty levels)
+    - `math500_passK` (~40k
+  rollouts over the 500 MATH-500 problems)
+    - `math12k_passK` (~130k) gives a tighter estimate but 
 - `LIMIT` — cap the number of rollouts. `None` processes the whole pool; a few
   thousand already pins the singleton fraction tightly, so set e.g. `2000` for a
   quick pass first.
@@ -141,6 +144,7 @@ POOL        = "math500_passK"
 LIMIT       = None
 SHARD_SIZE  = 1
 LOGIT_DTYPE = "float16"
+TOP_K       = None   # nucleus-size storage cap (None = GenConfig default 20). NOT a sampling limiter — the rollouts had none; raise to record larger nuclei
 OUT_ROOT    = "/content/math-rollouts-data"
 ```
 
@@ -174,6 +178,7 @@ stats, paths = build_token_nuclei(
     limit=LIMIT,
     shard_size=SHARD_SIZE,
     logit_dtype=LOGIT_DTYPE,
+    top_k=TOP_K,
     device="cuda",
 )
 ```
@@ -195,14 +200,11 @@ Loading weights:   0%|          | 0/338 [00:00<?, ?it/s]
   450/500 problems, 36736/40704 rollouts
   500/500 problems, 40704/40704 rollouts
 
-=== nucleus-size statistics: Qwen/Qwen2.5-Math-1.5B / math500_passK ===
+=== nucleus store: Qwen/Qwen2.5-Math-1.5B / math500_passK ===
   rollouts: 40,704   tokens: 61,831,319
   SINGLETON nuclei: 93.3% (57,693,565 / 61,831,319)
-  mean size 1.122   median 1   p90 1
-  chose top-1 token: 98.2% of positions
-  first response token: mean size 6.02, singleton 0.6%
-  singleton frac — correct 91.2% | incorrect 93.6%
-  size histogram: 1:93.3%  2:4.6%  3:1.2%  4:0.4%  5:0.2%  6:0.1%  7:0.1%  8:0.0%
+  full size / difficulty / correctness stats: compute post-hoc from the shards via
+  math_rollouts.analysis.nuclei_stats.summarize_nuclei (see notebook '03 - Analyze Rollout Nuclei').
 
 wrote 500 shards + _stats.json + _meta.json to /content/math-rollouts-data/generations/qwen2.5-math-1.5b/math500_passK_token_nuclei
 ```
@@ -212,9 +214,11 @@ wrote 500 shards + _stats.json + _meta.json to /content/math-rollouts-data/gener
 
 <!-- md -->
 
-The full summary as JSON, plus a histogram of nucleus sizes across all generated
-tokens. The first bar (size 1) is the singleton fraction — the headline number for
-the blog post.
+`build_token_nuclei` now returns only the **headline counts** (rollouts, tokens,
+singleton %). The full size distribution, per-difficulty bands, position profile, and
+correct/incorrect splits are computed post-hoc from the uploaded shards in the
+companion notebook **`03 - Analyze Rollout Nuclei`** (via
+`analysis.nuclei_stats.summarize_nuclei`) — keeping this compute notebook lean.
 
 <!-- code -->
 ```python
@@ -228,64 +232,8 @@ print(json.dumps(stats, indent=2))
   "n_rollouts": 40704,
   "n_tokens": 61831319,
   "singleton_count": 57693565,
-  "singleton_frac": 0.9330799655106824,
-  "mean_size": 1.1215901766546497,
-  "median_size": 1,
-  "p90_size": 1,
-  "chosen_is_top1_frac": 0.9822921778524569,
-  "size_histogram": {
-    "1": 57693565,
-    "2": 2816770,
-    "3": 725170,
-    "4": 259481,
-    "5": 113523,
-    "6": 58511,
-    "7": 36576,
-    "8": 24216,
-    "9": 22363,
-    "10": 23952,
-    "11": 4674,
-    "12": 3355,
-    "13": 3111,
-    "14": 3388,
-    "15": 3891,
-    "16": 1896,
-    "17": 1100,
-    "18": 981,
-    "19": 895,
-    "20": 33901
-  },
-  "first_token_mean_size": 6.022528498427673,
-  "first_token_singleton_frac": 0.006289308176100629,
-  "singleton_frac_correct": 0.9119837608166623,
-  "singleton_frac_incorrect": 0.936499337308231
+  "singleton_frac": 0.9330799655106824
 }
-```
-
-<!-- code -->
-```python
-import matplotlib.pyplot as plt
-
-hist = stats["size_histogram"]
-sizes = sorted(hist)
-pct = [hist[s] / stats["n_tokens"] * 100 for s in sizes]
-
-plt.figure(figsize=(8, 4.5))
-bars = plt.bar(sizes, pct, color="#4C72B0")
-plt.bar_label(bars, labels=[f"{p:.0f}%" if p >= 1 else "" for p in pct], fontsize=8)
-plt.xlabel("nucleus size (number of tokens sampling could pick)")
-plt.ylabel("% of generated tokens")
-plt.title(f"Nucleus size distribution — {MODEL_ID.split('/')[-1]} / {POOL}\n"
-          f"{stats['singleton_frac']*100:.1f}% of tokens have a singleton nucleus")
-plt.xticks(sizes)
-plt.tight_layout()
-plt.show()
-```
-
-<!-- output -->
-```
-<Figure size 800x450 with 1 Axes>
-[image/png, ~34 KB]
 ```
 
 <!-- md -->
@@ -343,10 +291,10 @@ TODO:
 > WARNING:huggingface_hub.hf_api:It seems you are trying to upload a large folder at once. This might take some time and then fail if the folder is too large. For such cases, it is recommended to upload in smaller batches or to use `HfApi().upload_large_folder(...)`/`hf upload-large-folder` instead. For more details, check out https://huggingface.co/docs/huggingface_hub/main/en/guides/upload#upload-a-large-folder.
 P
 
-<!-- code -->
-```python
-
-```
+<!-- md -->
+Singleton fraction **by difficulty band** (and the rest of the breakdowns) now lives
+in `03 - Analyze Rollout Nuclei`, computed from these uploaded shards with an even
+K-per-problem sample so the pass@K difficulty skew doesn't confound the numbers.
 
 <!-- md -->
 # ▂▂▂▂▂▂▂▂▂▂▂▂
@@ -442,14 +390,11 @@ generations/qwen2.5-math-1.5b-oat-zero/m(…):   0%|          | 0.00/17.0M [00:0
   450/500 problems, 19232/21312 rollouts
   500/500 problems, 21312/21312 rollouts
 
-=== nucleus-size statistics: sail/Qwen2.5-Math-1.5B-Oat-Zero / math500_passK ===
+=== nucleus store: sail/Qwen2.5-Math-1.5B-Oat-Zero / math500_passK ===
   rollouts: 21,312   tokens: 18,387,973
   SINGLETON nuclei: 94.6% (17,391,801 / 18,387,973)
-  mean size 1.066   median 1   p90 1
-  chose top-1 token: 98.7% of positions
-  first response token: mean size 1.06, singleton 93.7%
-  singleton frac — correct 95.7% | incorrect 94.4%
-  size histogram: 1:94.6%  2:4.6%  3:0.6%  4:0.1%  5:0.0%  6:0.0%  7:0.0%  8:0.0%
+  full size / difficulty / correctness stats: compute post-hoc from the shards via
+  math_rollouts.analysis.nuclei_stats.summarize_nuclei (see notebook '03 - Analyze Rollout Nuclei').
 
 wrote 500 shards + _stats.json + _meta.json to /content/math-rollouts-data/generations/qwen2.5-math-1.5b-oat-zero/math500_passK_token_nuclei
 ```
@@ -459,9 +404,8 @@ wrote 500 shards + _stats.json + _meta.json to /content/math-rollouts-data/gener
 
 <!-- md -->
 
-The full summary as JSON, plus a histogram of nucleus sizes across all generated
-tokens. The first bar (size 1) is the singleton fraction — the headline number for
-the blog post.
+Headline counts only — the full size distribution and breakdowns are computed
+post-hoc in `03 - Analyze Rollout Nuclei` from the uploaded shards.
 
 <!-- code -->
 ```python
@@ -475,63 +419,8 @@ print(json.dumps(stats, indent=2))
   "n_rollouts": 21312,
   "n_tokens": 18387973,
   "singleton_count": 17391801,
-  "singleton_frac": 0.9458248062469964,
-  "mean_size": 1.065938589315962,
-  "median_size": 1,
-  "p90_size": 1,
-  "chosen_is_top1_frac": 0.9872517215464696,
-  "size_histogram": {
-    "1": 17391801,
-    "2": 842588,
-    "3": 118390,
-    "4": 23052,
-    "5": 6142,
-    "6": 2077,
-    "7": 1146,
-    "8": 962,
-    "9": 1140,
-    "10": 622,
-    "11": 21,
-    "12": 10,
-    "13": 2,
-    "14": 3,
-    "15": 5,
-    "17": 1,
-    "18": 2,
-    "19": 2,
-    "20": 7
-  },
-  "first_token_mean_size": 1.0638138138138138,
-  "first_token_singleton_frac": 0.9369369369369369,
-  "singleton_frac_correct": 0.9568130947811305,
-  "singleton_frac_incorrect": 0.9435012503632632
+  "singleton_frac": 0.9458248062469964
 }
-```
-
-<!-- code -->
-```python
-import matplotlib.pyplot as plt
-
-hist = stats["size_histogram"]
-sizes = sorted(hist)
-pct = [hist[s] / stats["n_tokens"] * 100 for s in sizes]
-
-plt.figure(figsize=(8, 4.5))
-bars = plt.bar(sizes, pct, color="#4C72B0")
-plt.bar_label(bars, labels=[f"{p:.0f}%" if p >= 1 else "" for p in pct], fontsize=8)
-plt.xlabel("nucleus size (number of tokens sampling could pick)")
-plt.ylabel("% of generated tokens")
-plt.title(f"Nucleus size distribution — {MODEL_ID.split('/')[-1]} / {POOL}\n"
-          f"{stats['singleton_frac']*100:.1f}% of tokens have a singleton nucleus")
-plt.xticks(sizes)
-plt.tight_layout()
-plt.show()
-```
-
-<!-- output -->
-```
-<Figure size 800x450 with 1 Axes>
-[image/png, ~35 KB]
 ```
 
 <!-- md -->

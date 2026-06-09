@@ -45,7 +45,8 @@ generations/<model-slug>/
     scores.parquet
     policies.csv
     manifest.json
-  <pool>.parquet             self-contained naturally-sampled pools (is_correct inline)
+  <pool>.parquet             self-contained naturally-sampled pool (scored rollouts)
+  <pool>.meta.json           per-pool provenance (scorer, sampling config, batches)
 ```
 
 `model-slug` = lowercase HF id minus the org (`Qwen/Qwen2.5-Math-1.5B` ->
@@ -63,12 +64,10 @@ number. The split is authoritative (also a column in `math_problems.parquet`):
 | `test`  | 4,500 | math12k test portion (excluding math500) |
 | `math500` | 500 | the MATH-500 subset, **held out of `test`** |
 
-So `math500/geometry/9467` is the MATH-500 geometry problem that lives at math12k
-index 9467. The same id is used everywhere — pools, experiment files, and
-`policies.csv` (older files keyed math500 problems by the HF id `test/.../<n>.json`;
-that's gone). To recover the canonical HF MATH-500 id (e.g. `test/geometry/627.json`,
-for matching published numbers), join `mappings/math500_to_hf.csv`. There is no
-longer a second id column on the bulk rows.
+So `math500/geometry/9467` is the MATH-500 geometry problem at math12k index 9467.
+This one id is used everywhere — pools, experiment files, and `policies.csv`. To
+recover the canonical HF MATH-500 id (e.g. `test/geometry/627.json`, for matching
+published numbers), join `mappings/math500_to_hf.csv`.
 
 ## Models
 
@@ -79,17 +78,18 @@ longer a second id column on the bulk rows.
 
 ## Generation config
 
-All canonical runs share one sampling config (`gen_config_id = 200`), used for **both**
-the nucleus fan-out and the forced/natural rollouts:
+All canonical runs share one sampling config (`gen_config_id = 200`):
 
 ```
-temperature = 0.6   top_p = 0.95   top_k = 20   max_tokens = 3000   max_model_len = 4096
+temperature = 0.6   top_p = 0.95   max_tokens = 3000   max_model_len = 4096
 ```
 
-`top_k` caps the nucleus size; the nucleus is computed on temperature-scaled probs,
-kept by top-p (always keeping the top token), then renormalized within the kept set.
-Rows with a different `gen_config_id` are **not** the same sampling distribution — do
-not pool across them.
+Rollouts are sampled with **temperature + top-p only** — there is no `top_k` limiter
+on generation. (`top_k = 20` appears in the recorded `GenConfig` because the *post-hoc*
+per-token nucleus computation uses it as a cap on how many nucleus members it stores;
+that nucleus is computed on temperature-scaled probs, kept by top-p — always keeping
+the top token — then renormalized within the kept set.) Rows with a different
+`gen_config_id` are **not** the same sampling distribution — do not pool across them.
 
 > **Precision matters.** Rollouts were sampled with **bfloat16** (vLLM). Some
 > first-token logits are nearly tied, so recomputing nucleus membership/probabilities
@@ -140,17 +140,27 @@ inbound prob), `path_prob`, `branch_size`, `terminal`, `is_thinking`.
 
 ### Naturally-sampled pools — `generations/<model>/<pool>.parquet`
 
-Self-contained, **`is_correct` inline** (no separate scores file), one row per sample.
-These are NOT opener-forced — the model chose its own first token. Pools include
-`math500_passK`, `math12k_passK`, `math12k_K64`, `math12k_L4_5_K64`, `math12k_additional`
-(availability varies by model). Columns:
+A **pool** is a self-contained set of naturally-sampled rollouts: the model chose its
+own first token (no forced opener), K completions per problem, scored. Structurally a
+pool is just *scored rollouts in the canonical rollout schema* — the
+`rollouts.parquet` columns above, with `depth = 0`, `branch_path = []`,
+`opener_token_ids = []` (there's no forced opener), plus two columns:
 
-`unique_id` (`<split>/...`), `problem_idx`, `run_id`, `sample_idx`, `producer`
-(e.g. `random`), `completion_text`, `completion_token_ids`, `num_tokens`,
-`initial_num_tokens`, `is_correct`, `finish_reason`, `closed_think`, `n_inside_think`,
-`n_post_think`, `seed`, `temperature`, `top_p`, `model_id`, `max_gen_len`,
-`gen_config_id`, `timestamp`, `subject`, `level`, `answer`. The `*_think` columns are generic carry-overs and are inert for
-these non-thinking models.
+- **`is_correct`** (bool) — inline correctness, so a pool stands alone.
+- **`scorer_id`** — the versioned scorer that produced it (`boxed-match-stop-v1` for
+  the boxed-answer models here; thinking models use `post-think-v1`). Correctness is
+  reproducible from `completion_text`, so you can re-score under a different
+  `scorer_id` at any time.
+
+A sibling **`<pool>.meta.json`** records per-pool provenance: the `scorer_id`, the
+sampling `gen_config`, and the generation batches (`run_id` → sample count).
+
+Pools available (varies by model): `math500_passK`, `math12k_passK`, `math12k_K64`,
+`math12k_L4_5_K64`, `math12k_additional`. Most are **pass@K**-style — harder problems
+carry more rollouts — so per-problem K varies; group by `unique_id` and use the actual
+row count rather than assuming a fixed K (only the `_K64` references are uniform).
+Extending a pool to a target K per problem appends a fresh `run_id`, keeping
+`(unique_id, run_id, sample_idx)` unique.
 
 ## Grouping & accuracy
 
@@ -211,11 +221,6 @@ row index in that dataset (so the id is reproducible), and:
 `problems/math500.parquet` is the 500 math500-split rows plus their HF MATH-500
 `math500_native_id` (the same cross-ref as `mappings/math500_to_hf.csv`). Rows with
 no boxed answer (~4) are dropped.
-
-> The original `unique_id`s used a `train/` prefix for every row and a separate
-> `math500_native_id` (with the HF MATH-500 set as the test authority); since the
-> overlapping problem text + answers are identical, that was collapsed to the single
-> split-aware id above and the HF set demoted to a cross-ref.
 
 **Rollouts (`generations/`).** Generated from the public **Qwen2.5-Math-1.5B** and
 **Qwen2.5-Math-1.5B-Oat-Zero** checkpoints with the config above (the `math-rollouts`

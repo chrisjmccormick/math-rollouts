@@ -67,6 +67,21 @@ ROLLOUTS_SCHEMA = pa.schema([
     ("finish_reason", pa.string()),            # stop | length
 ])
 
+# A natural-sampled POOL is just scored rollouts: the canonical rollout schema plus
+# an inline correctness verdict and the id of the scorer that produced it. Natural
+# rows carry depth=0, branch_path=[], opener_token_ids=[] (no forced opener) so a pool
+# and a forced-opener experiment share one schema and could be concatenated. This is
+# the single, clean definition that replaces the legacy dev-project pool columns
+# (problem_idx / producer / initial_num_tokens / think-segmentation / timestamp /
+# level were dropped; level/answer/subject are recoverable from the problems table,
+# but answer+subject stay denormalized as in ROLLOUTS_SCHEMA).
+POOL_SCHEMA = pa.schema(
+    list(ROLLOUTS_SCHEMA) + [
+        pa.field("is_correct", pa.bool_()),
+        pa.field("scorer_id", pa.string()),   # which scorer produced is_correct
+    ]
+)
+
 SCORES_SCHEMA = pa.schema([
     ("model_id", pa.string()),
     ("unique_id", pa.string()),

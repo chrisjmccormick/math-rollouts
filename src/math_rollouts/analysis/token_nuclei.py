@@ -23,7 +23,10 @@ time; use ``shard_size`` > 1 to bucket, e.g. for the larger math12k pools)::
 
     <out_dir>/generations/<model-slug>/<pool>_token_nuclei/
         <shard>.parquet ...   per-rollout rows; see _write_shard for the columns
-        _stats.json           aggregate size statistics (the blog numbers)
+        _stats.json           headline counts only (rollouts / tokens / singleton %);
+                              full size, difficulty, and correct/incorrect breakdowns
+                              are computed post-hoc from the shards by
+                              ``analysis.nuclei_stats.summarize_nuclei``
         _meta.json            model / engine / dtype / config / keep-rule
 
 Per row the kept entries are stored FLAT (``kept_ids`` / ``kept_logits``) with a
@@ -135,14 +138,6 @@ def _write_shard(path: Path, rows: list[dict], pa_logit) -> None:
     pq.write_table(table, path, compression="zstd")
 
 
-def _percentile_from_counts(counts, q):
-    import numpy as np
-    total = counts.sum()
-    target = q / 100.0 * total
-    cum = np.cumsum(counts)
-    return int(np.searchsorted(cum, target))
-
-
 def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                        limit: int | None = None, shard_size: int = 1,
                        max_batch_tokens: int = 24000, device: str = "cuda",
@@ -150,7 +145,6 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                        top_k: int | None = None):
     """Compute the per-token nucleus store for ``pool`` and write sharded parquets +
     ``_stats.json`` + ``_meta.json``. Returns ``(stats, paths)``."""
-    import numpy as np
     import pyarrow as pa
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -201,27 +195,11 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
     shard_dir.mkdir(parents=True, exist_ok=True)
 
     K = top_k if top_k is not None else cfg.top_k
-    size_counts = np.zeros(K + 1, dtype=np.int64)
-    first_counts = np.zeros(K + 1, dtype=np.int64)
-    corr_counts = np.zeros(K + 1, dtype=np.int64)
-    incorr_counts = np.zeros(K + 1, dtype=np.int64)
-    n_tokens = n_top1 = n_done = problems_done = 0
-
-    # Per-difficulty-band accumulators; populated when difficulty data is registered.
-    try:
-        from .difficulty import BAND_ORDER, band_for as _band_for, MODEL_DATA as _BD
-        if model_id in _BD:
-            _bfor = lambda uid: _band_for(model_id, uid, default="Unknown")
-            _band_labels = BAND_ORDER + ["Unknown"]
-        else:
-            _bfor = None
-            _band_labels = []
-    except ImportError:
-        _bfor = None
-        _band_labels = []
-    band_size_counts = {b: np.zeros(K + 1, dtype=np.int64) for b in _band_labels}
-    band_n_tokens:  dict[str, int] = {b: 0 for b in _band_labels}
-    band_n_top1:    dict[str, int] = {b: 0 for b in _band_labels}
+    # Headline counters only. The full size distribution, per-difficulty bands, and
+    # correct/incorrect splits are now computed POST-HOC from the written shards by
+    # ``math_rollouts.analysis.nuclei_stats.summarize_nuclei`` — keeping this compute
+    # path free of analysis/difficulty concerns.
+    n_tokens = singleton_count = n_done = problems_done = 0
 
     for shard_idx, start in enumerate(range(0, len(problems), shard_size)):
         chunk_uids = problems[start:start + shard_size]
@@ -259,21 +237,9 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                     "kept_ids": ids_flat.astype("int32").tolist(),
                     "kept_logits": logit_flat,
                 })
-                bc = np.bincount(sizes, minlength=K + 1)[:K + 1]
-                size_counts += bc
-                first_counts[int(sizes[0])] += 1
-                if r["is_correct"]:
-                    corr_counts += bc
-                else:
-                    incorr_counts += bc
                 n_tokens += T
-                n_top1 += int(top1.sum())
+                singleton_count += int((sizes == 1).sum())
                 n_done += 1
-                if _bfor is not None:
-                    b = _bfor(r["unique_id"])
-                    band_size_counts[b] += bc
-                    band_n_tokens[b] += T
-                    band_n_top1[b] += int(top1.sum())
             del logits
         name = (chunk_uids[0].replace("/", "_") + ".parquet") if shard_size == 1 \
             else f"shard-{shard_idx:05d}.parquet"
@@ -283,35 +249,11 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
             print(f"  {problems_done}/{len(problems)} problems, {n_done}/{n_roll} rollouts",
                   flush=True)
 
-    ramp = np.arange(K + 1)
-    frac1 = lambda c: float(c[1] / c.sum()) if c.sum() else float("nan")
     stats = {
         "n_rollouts": n_done,
         "n_tokens": n_tokens,
-        "singleton_count": int(size_counts[1]),
-        "singleton_frac": float(size_counts[1] / n_tokens),
-        "mean_size": float((ramp * size_counts).sum() / n_tokens),
-        "median_size": _percentile_from_counts(size_counts, 50),
-        "p90_size": _percentile_from_counts(size_counts, 90),
-        "chosen_is_top1_frac": float(n_top1 / n_tokens),
-        "size_histogram": {int(k): int(v) for k, v in enumerate(size_counts) if v},
-        "first_token_mean_size": float((ramp * first_counts).sum() / first_counts.sum()),
-        "first_token_singleton_frac": frac1(first_counts),
-        "singleton_frac_correct": frac1(corr_counts),
-        "singleton_frac_incorrect": frac1(incorr_counts),
-        "by_band": {
-            b: {
-                "n_tokens": int(band_n_tokens[b]),
-                "singleton_count": int(band_size_counts[b][1]),
-                "singleton_frac": float(band_size_counts[b][1] / band_n_tokens[b])
-                                  if band_n_tokens[b] else float("nan"),
-                "mean_size": float((ramp * band_size_counts[b]).sum() / band_n_tokens[b])
-                             if band_n_tokens[b] else float("nan"),
-                "chosen_is_top1_frac": float(band_n_top1[b] / band_n_tokens[b])
-                                       if band_n_tokens[b] else float("nan"),
-            }
-            for b in _band_labels if band_n_tokens.get(b, 0) > 0
-        },
+        "singleton_count": singleton_count,
+        "singleton_frac": float(singleton_count / n_tokens) if n_tokens else float("nan"),
     }
     meta = {
         "model_id": model_id, "pool": pool,
@@ -334,28 +276,13 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
 
 
 def _print_summary(stats: dict, pool: str, model_id: str) -> None:
-    h = stats["size_histogram"]
-    print(f"\n=== nucleus-size statistics: {model_id} / {pool} ===")
+    print(f"\n=== nucleus store: {model_id} / {pool} ===")
     print(f"  rollouts: {stats['n_rollouts']:,}   tokens: {stats['n_tokens']:,}")
     print(f"  SINGLETON nuclei: {stats['singleton_frac']*100:.1f}% "
           f"({stats['singleton_count']:,} / {stats['n_tokens']:,})")
-    print(f"  mean size {stats['mean_size']:.3f}   median {stats['median_size']}   "
-          f"p90 {stats['p90_size']}")
-    print(f"  chose top-1 token: {stats['chosen_is_top1_frac']*100:.1f}% of positions")
-    print(f"  first response token: mean size {stats['first_token_mean_size']:.2f}, "
-          f"singleton {stats['first_token_singleton_frac']*100:.1f}%")
-    print(f"  singleton frac — correct {stats['singleton_frac_correct']*100:.1f}% | "
-          f"incorrect {stats['singleton_frac_incorrect']*100:.1f}%")
-    top = sorted(h.items())[:8]
-    print("  size histogram:", "  ".join(f"{k}:{v/stats['n_tokens']*100:.1f}%" for k, v in top))
-    if stats.get("by_band"):
-        print("  by difficulty band:")
-        for band, bs in stats["by_band"].items():
-            if bs["n_tokens"]:
-                print(f"    {band:<12} singleton {bs['singleton_frac']*100:.1f}%  "
-                      f"mean size {bs['mean_size']:.3f}  "
-                      f"top-1 {bs['chosen_is_top1_frac']*100:.1f}%  "
-                      f"({bs['n_tokens']:,} tokens)")
+    print("  full size / difficulty / correctness stats: compute post-hoc from the "
+          "shards via\n  math_rollouts.analysis.nuclei_stats.summarize_nuclei "
+          "(see notebook '03 - Analyze Rollout Nuclei').")
 
 
 def main() -> None:
@@ -371,8 +298,9 @@ def main() -> None:
                     help="float16 (default) matches the bf16 compute precision and halves "
                          "the logit bytes; use float32 if your pyarrow can't write float16")
     ap.add_argument("--top-k", type=int, default=None,
-                    help="nucleus size cap (default: GenConfig.top_k = 20, which matches "
-                         "the original vLLM sampling); raise to see larger nuclei")
+                    help="cap on the recorded nucleus size, a storage bound only "
+                         "(default: GenConfig.top_k = 20); the rollouts themselves were "
+                         "NOT sampled with a top_k limiter. Raise to see larger nuclei")
     ap.add_argument("--max-batch-tokens", type=int, default=24000)
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
