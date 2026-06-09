@@ -110,9 +110,12 @@ def _pack_batches(items, max_batch_tokens: int):
 
 
 def _write_shard(path: Path, rows: list[dict], pa_logit) -> None:
+    import numpy as np
     import pyarrow as pa
     import pyarrow.parquet as pq
 
+    # PyArrow float16 rejects Python floats; cast numpy arrays to the target dtype first.
+    np_logit = np.float16 if pa_logit == pa.float16() else np.float32
     col = lambda k, t: pa.array([r[k] for r in rows], type=t)
     table = pa.table({
         "model_id": col("model_id", pa.string()),
@@ -126,7 +129,8 @@ def _write_shard(path: Path, rows: list[dict], pa_logit) -> None:
         "chosen_is_top1": col("chosen_is_top1", pa.list_(pa.bool_())),
         "keep_counts": col("keep_counts", pa.list_(pa.int16())),
         "kept_ids": col("kept_ids", pa.list_(pa.int32())),
-        "kept_logits": col("kept_logits", pa.list_(pa_logit)),
+        "kept_logits": pa.array([r["kept_logits"].astype(np_logit) for r in rows],
+                                type=pa.list_(pa_logit)),
     })
     pq.write_table(table, path, compression="zstd")
 
@@ -142,7 +146,8 @@ def _percentile_from_counts(counts, q):
 def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                        limit: int | None = None, shard_size: int = 1,
                        max_batch_tokens: int = 24000, device: str = "cuda",
-                       logit_dtype: str = "float16", progress_every: int = 50):
+                       logit_dtype: str = "float16", progress_every: int = 50,
+                       top_k: int | None = None):
     """Compute the per-token nucleus store for ``pool`` and write sharded parquets +
     ``_stats.json`` + ``_meta.json``. Returns ``(stats, paths)``."""
     import numpy as np
@@ -195,12 +200,28 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
     shard_dir = Path(out_dir) / "generations" / slug / f"{pool}_token_nuclei"
     shard_dir.mkdir(parents=True, exist_ok=True)
 
-    K = cfg.top_k
+    K = top_k if top_k is not None else cfg.top_k
     size_counts = np.zeros(K + 1, dtype=np.int64)
     first_counts = np.zeros(K + 1, dtype=np.int64)
     corr_counts = np.zeros(K + 1, dtype=np.int64)
     incorr_counts = np.zeros(K + 1, dtype=np.int64)
     n_tokens = n_top1 = n_done = problems_done = 0
+
+    # Per-difficulty-band accumulators; populated when difficulty data is registered.
+    try:
+        from .difficulty import BAND_ORDER, band_for as _band_for, MODEL_DATA as _BD
+        if model_id in _BD:
+            _bfor = lambda uid: _band_for(model_id, uid, default="Unknown")
+            _band_labels = BAND_ORDER + ["Unknown"]
+        else:
+            _bfor = None
+            _band_labels = []
+    except ImportError:
+        _bfor = None
+        _band_labels = []
+    band_size_counts = {b: np.zeros(K + 1, dtype=np.int64) for b in _band_labels}
+    band_n_tokens:  dict[str, int] = {b: 0 for b in _band_labels}
+    band_n_top1:    dict[str, int] = {b: 0 for b in _band_labels}
 
     for shard_idx, start in enumerate(range(0, len(problems), shard_size)):
         chunk_uids = problems[start:start + shard_size]
@@ -236,7 +257,7 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                     "chosen_is_top1": top1.astype(bool).tolist(),
                     "keep_counts": keepn.astype("int16").tolist(),
                     "kept_ids": ids_flat.astype("int32").tolist(),
-                    "kept_logits": logit_flat.tolist(),
+                    "kept_logits": logit_flat,
                 })
                 bc = np.bincount(sizes, minlength=K + 1)[:K + 1]
                 size_counts += bc
@@ -248,6 +269,11 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                 n_tokens += T
                 n_top1 += int(top1.sum())
                 n_done += 1
+                if _bfor is not None:
+                    b = _bfor(r["unique_id"])
+                    band_size_counts[b] += bc
+                    band_n_tokens[b] += T
+                    band_n_top1[b] += int(top1.sum())
             del logits
         name = (chunk_uids[0].replace("/", "_") + ".parquet") if shard_size == 1 \
             else f"shard-{shard_idx:05d}.parquet"
@@ -273,6 +299,19 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
         "first_token_singleton_frac": frac1(first_counts),
         "singleton_frac_correct": frac1(corr_counts),
         "singleton_frac_incorrect": frac1(incorr_counts),
+        "by_band": {
+            b: {
+                "n_tokens": int(band_n_tokens[b]),
+                "singleton_count": int(band_size_counts[b][1]),
+                "singleton_frac": float(band_size_counts[b][1] / band_n_tokens[b])
+                                  if band_n_tokens[b] else float("nan"),
+                "mean_size": float((ramp * band_size_counts[b]).sum() / band_n_tokens[b])
+                             if band_n_tokens[b] else float("nan"),
+                "chosen_is_top1_frac": float(band_n_top1[b] / band_n_tokens[b])
+                                       if band_n_tokens[b] else float("nan"),
+            }
+            for b in _band_labels if band_n_tokens.get(b, 0) > 0
+        },
     }
     meta = {
         "model_id": model_id, "pool": pool,
@@ -309,6 +348,14 @@ def _print_summary(stats: dict, pool: str, model_id: str) -> None:
           f"incorrect {stats['singleton_frac_incorrect']*100:.1f}%")
     top = sorted(h.items())[:8]
     print("  size histogram:", "  ".join(f"{k}:{v/stats['n_tokens']*100:.1f}%" for k, v in top))
+    if stats.get("by_band"):
+        print("  by difficulty band:")
+        for band, bs in stats["by_band"].items():
+            if bs["n_tokens"]:
+                print(f"    {band:<12} singleton {bs['singleton_frac']*100:.1f}%  "
+                      f"mean size {bs['mean_size']:.3f}  "
+                      f"top-1 {bs['chosen_is_top1_frac']*100:.1f}%  "
+                      f"({bs['n_tokens']:,} tokens)")
 
 
 def main() -> None:
@@ -323,12 +370,16 @@ def main() -> None:
     ap.add_argument("--logit-dtype", default="float16", choices=["float16", "float32"],
                     help="float16 (default) matches the bf16 compute precision and halves "
                          "the logit bytes; use float32 if your pyarrow can't write float16")
+    ap.add_argument("--top-k", type=int, default=None,
+                    help="nucleus size cap (default: GenConfig.top_k = 20, which matches "
+                         "the original vLLM sampling); raise to see larger nuclei")
     ap.add_argument("--max-batch-tokens", type=int, default=24000)
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     build_token_nuclei(a.model_id, a.pool, a.out_root, limit=a.limit,
                        shard_size=a.shard_size, logit_dtype=a.logit_dtype,
-                       max_batch_tokens=a.max_batch_tokens, device=a.device)
+                       top_k=a.top_k, max_batch_tokens=a.max_batch_tokens,
+                       device=a.device)
 
 
 if __name__ == "__main__":

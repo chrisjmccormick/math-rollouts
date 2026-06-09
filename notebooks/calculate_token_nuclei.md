@@ -105,9 +105,10 @@ pip_url = f"git+https://{_auth}github.com/{GH_OWNER}/math-rollouts.git"
 <!-- md -->
 # Configure
 
-- `POOL` — which naturally-sampled pool to analyze. `math500_passK` (~40k
-  rollouts over the 500 MATH-500 problems) is a good default; `math12k_passK`
-  (~130k) gives a tighter estimate but takes longer.
+- `POOL` — which naturally-sampled pool to analyze. `math12k_L4_5_K64` (64
+  rollouts per problem, uniform across all difficulty levels) is the best choice
+  for difficulty-band analysis; `math500_passK` (~40k rollouts, but skewed toward
+  hard problems) or `math12k_passK` (~130k) are alternatives.
 - `LIMIT` — cap the number of rollouts. `None` processes the whole pool; a few
   thousand already pins the singleton fraction tightly, so set e.g. `2000` for a
   quick pass first.
@@ -120,10 +121,11 @@ pip_url = f"git+https://{_auth}github.com/{GH_OWNER}/math-rollouts.git"
 <!-- code -->
 ```python
 MODEL_ID    = "Qwen/Qwen2.5-Math-1.5B"
-POOL        = "math500_passK"
+POOL        = "math12k_L4_5_K64"
 LIMIT       = None
 SHARD_SIZE  = 1
 LOGIT_DTYPE = "float16"
+TOP_K       = None   # None = use GenConfig default (20, matching original sampling); raise to see larger nuclei
 OUT_ROOT    = "/content/math-rollouts-data"
 ```
 
@@ -155,6 +157,7 @@ stats, paths = build_token_nuclei(
     limit=LIMIT,
     shard_size=SHARD_SIZE,
     logit_dtype=LOGIT_DTYPE,
+    top_k=TOP_K,
     device="cuda",
 )
 ```
@@ -190,6 +193,32 @@ plt.title(f"Nucleus size distribution — {MODEL_ID.split('/')[-1]} / {POOL}\n"
 plt.xticks(sizes)
 plt.tight_layout()
 plt.show()
+```
+
+<!-- code -->
+```python
+# Singleton fraction by difficulty band (requires difficulty data to be registered
+# for this model; the by_band dict is empty otherwise).
+by_band = stats.get("by_band", {})
+if by_band:
+    bands  = list(by_band.keys())
+    fracs  = [by_band[b]["singleton_frac"] * 100 for b in bands]
+    tokens = [by_band[b]["n_tokens"] for b in bands]
+
+    fig, ax = plt.subplots(figsize=(7, 4))
+    colors = ["#2ecc71", "#3498db", "#e67e22", "#e74c3c", "#8e44ad"]
+    bars = ax.bar(bands, fracs, color=colors[:len(bands)])
+    ax.bar_label(bars, labels=[f"{f:.1f}%" for f in fracs], fontsize=9)
+    ax.set_ylim(0, 105)
+    ax.set_ylabel("singleton nucleus % of tokens")
+    ax.set_title(f"Singleton fraction by difficulty — {MODEL_ID.split('/')[-1]} / {POOL}")
+    for bar, n in zip(bars, tokens):
+        ax.text(bar.get_x() + bar.get_width() / 2, 2, f"{n:,}\ntokens",
+                ha="center", va="bottom", fontsize=7, color="white")
+    plt.tight_layout()
+    plt.show()
+else:
+    print("No by_band data — difficulty not registered for this model.")
 ```
 
 <!-- md -->
