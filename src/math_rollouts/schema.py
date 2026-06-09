@@ -102,8 +102,16 @@ ROLLOUT_KEY = ["model_id", "unique_id", "run_id", "branch_path", "sample_idx"]
 GROUP_KEY = ["model_id", "unique_id", "branch_path", "run_id"]
 
 
+def _none_if_nan(v: Any) -> Any:
+    """Map a float NaN to None. Rows sourced from a pandas DataFrame represent a
+    null nullable-int (e.g. ``seed``) as float NaN, which pyarrow refuses to coerce
+    to an integer field; NaN is never a meaningful stored value in these schemas, so
+    treat it as null."""
+    return None if isinstance(v, float) and v != v else v
+
+
 def table_from_rows(rows: list[dict[str, Any]], schema: pa.Schema) -> pa.Table:
     """Build a pyarrow Table from row dicts, coercing to ``schema`` (fills missing
     columns with null). Keeps every writer honest against one schema definition."""
-    cols = {name: [r.get(name) for r in rows] for name in schema.names}
+    cols = {name: [_none_if_nan(r.get(name)) for r in rows] for name in schema.names}
     return pa.table(cols, schema=schema)

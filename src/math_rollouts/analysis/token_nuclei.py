@@ -64,17 +64,22 @@ def _sequence_kept(gen_logits, chosen_ids, *, temperature, top_p, top_k,
     for s in range(0, gen_logits.shape[0], pos_chunk):
         gl = gen_logits[s:s + pos_chunk].float()
         ch = chosen_ids[s:s + pos_chunk]
+        # top_k is a storage/size cap; top_k=None means UNCAPPED (full vocab), so the
+        # true top-p nucleus size is recorded even where it runs to hundreds of tokens
+        # (flat distributions where top-p "fails"). Those rare cases are left pure for
+        # analysis to filter rather than silently censored.
+        k_eff = gl.shape[-1] if top_k is None else min(top_k, gl.shape[-1])
         lse = torch.logsumexp(gl / temperature, dim=-1, keepdim=True)
         # topk on raw logits == topk on scaled (monotonic); store the RAW logit.
-        top_raw, top_idx = torch.topk(gl, top_k, dim=-1)
+        top_raw, top_idx = torch.topk(gl, k_eff, dim=-1)
         top_prob = torch.exp(top_raw / temperature - lse)
         csum = torch.cumsum(top_prob, dim=-1)
         keep = (csum - top_prob) < top_p
         keep[:, 0] = True
-        size = keep.sum(dim=-1)                                   # [t], 1..top_k
+        size = keep.sum(dim=-1)                                   # [t], 1..k_eff
         keep_n = torch.where(size <= 1, torch.full_like(size, SINGLETON_KEEP),
-                             torch.clamp(size, min=BRANCH_MIN))    # max already <= top_k
-        store = torch.arange(top_k, device=gl.device).unsqueeze(0) < keep_n.unsqueeze(1)
+                             torch.clamp(size, min=BRANCH_MIN))    # max already <= k_eff
+        store = torch.arange(k_eff, device=gl.device).unsqueeze(0) < keep_n.unsqueeze(1)
         sizes_l.append(size.to(torch.int16))
         top1_l.append(top_idx[:, 0] == ch)
         keepn_l.append(keep_n.to(torch.int16))
@@ -194,7 +199,8 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
     shard_dir = Path(out_dir) / "generations" / slug / f"{pool}_token_nuclei"
     shard_dir.mkdir(parents=True, exist_ok=True)
 
-    K = top_k if top_k is not None else cfg.top_k
+    # top_k=-1 (or any negative) disables the cap entirely -> uncapped (None).
+    K = None if (top_k is not None and top_k < 0) else (top_k if top_k is not None else cfg.top_k)
     # Headline counters only. The full size distribution, per-difficulty bands, and
     # correct/incorrect splits are now computed POST-HOC from the written shards by
     # ``math_rollouts.analysis.nuclei_stats.summarize_nuclei`` — keeping this compute
@@ -259,9 +265,10 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
         "model_id": model_id, "pool": pool,
         "engine": "hf-teacher-forced", "dtype": "bfloat16",
         "logits": "raw (pre-temperature)", "logit_storage_dtype": logit_dtype,
-        "temperature": cfg.temperature, "top_p": cfg.top_p, "top_k": K,
+        "temperature": cfg.temperature, "top_p": cfg.top_p,
+        "top_k": ("uncapped" if K is None else K),
         "keep_rule": {"singleton_keep": SINGLETON_KEEP, "branch_min": BRANCH_MIN,
-                      "branch_max": K},
+                      "branch_max": ("uncapped" if K is None else K)},
         "n_rollouts": n_done, "n_problems": len(problems), "shard_size": shard_size,
         "columns": "kept_ids/kept_logits are FLAT, split per position on keep_counts "
                    "(see math_rollouts.analysis.token_nuclei.unpack_kept)",
