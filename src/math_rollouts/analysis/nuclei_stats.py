@@ -7,12 +7,28 @@ DataFrame of those shard rows, so reports can reshape the pool (e.g. an even-K
 subsample) and recompute size statistics without re-running the GPU job.
 
 A shard-row DataFrame has at least: ``unique_id``, ``answer_matches``, ``nuc_sizes``
-(per-token list, sizes in ``1..top_k``) and ``chosen_is_top1`` (per-token bool
-list). ``load_token_nuclei_pool`` in ``data.hf`` returns exactly this.
+(per-token list of true top-p sizes) and ``chosen_is_top1`` (per-token bool list).
+``load_token_nuclei_pool`` in ``data.hf`` returns exactly this.
+
+The compute side (``token_nuclei``) records the **uncapped** top-p size, which on flat
+distributions can run to hundreds of tokens — and in the int16 store can even overflow
+to a negative. Every aggregator here folds any size at/above its ``top_k`` cap (and any
+out-of-range/overflowed value) into the top bucket, so a "20+" branch is counted as
+``top_k`` rather than crashing ``np.bincount`` or skewing a sum.
 """
 from __future__ import annotations
 
-DEFAULT_TOP_K = 20  # GenConfig.top_k — stored nucleus sizes never exceed this.
+DEFAULT_TOP_K = 20  # GenConfig.top_k — the analysis cap; larger nuclei fold into this bucket.
+
+
+def _clip_sizes(a, top_k):
+    """Fold uncapped/overflowed nucleus sizes into ``[1, top_k]``.
+
+    Sizes are stored uncapped (and in int16, so a nucleus wider than 32767 wraps
+    negative). Anything below 1 or above ``top_k`` is a branch at least as wide as the
+    cap, so map it to ``top_k`` — keeping every value a valid bincount/index in range."""
+    import numpy as np
+    return np.where((a < 1) | (a > top_k), top_k, a)
 
 
 def _percentile_from_counts(counts, q):
@@ -25,13 +41,45 @@ def _percentile_from_counts(counts, q):
 
 
 def size_histogram(df, top_k: int = DEFAULT_TOP_K):
-    """Counts of nucleus sizes ``0..top_k`` summed over every token of every row."""
+    """Counts of nucleus sizes ``0..top_k`` summed over every token of every row.
+
+    Linear, single-token resolution — good for the small-size head (and the headline
+    singleton bar), but it folds everything ``>= top_k`` into the top bin. For the full
+    heavy-tailed picture (sizes run uncapped to tens of thousands on flat
+    distributions) use ``size_distribution``."""
     import numpy as np
     counts = np.zeros(top_k + 1, dtype=np.int64)
     for arr in df["nuc_sizes"]:
-        a = np.asarray(arr, dtype=np.int64)
+        a = _clip_sizes(np.asarray(arr, dtype=np.int64), top_k)
         counts += np.bincount(a, minlength=top_k + 1)[:top_k + 1]
     return counts
+
+
+# Exact integer bins where the mass is (1..8), then octaves out to the vocabulary,
+# so the recovered long tail stays visible instead of piling into one bar.
+DEFAULT_SIZE_EDGES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 33, 65, 129, 257, 513, 1025,
+                      2049, 4097, 8193, 16385, 32769, 65537, 131073, 262145]
+
+
+def size_distribution(df, edges=None):
+    """Heavy-tail-aware nucleus-size histogram. Returns ``(labels, counts)`` where bin
+    ``i`` covers sizes ``[edges[i], edges[i+1])``. The default ``DEFAULT_SIZE_EDGES``
+    keeps single-token resolution for sizes 1..8 (the singleton bar plus the small
+    branches that carry the mass) and then doubles — ``9-16``, ``17-32`` … up to the
+    vocabulary — so flat-distribution nuclei in the hundreds-to-tens-of-thousands show
+    up as their own bars rather than a misleading spike at the cap.
+
+    Plot ``counts`` against ``labels`` as *categorical* (equal-width) bars; an octave
+    axis drawn on a linear scale would squash the head."""
+    import numpy as np
+    edges = np.asarray(DEFAULT_SIZE_EDGES if edges is None else edges)
+    counts = np.zeros(len(edges) - 1, dtype=np.int64)
+    for arr in df["nuc_sizes"]:
+        a = np.asarray(arr, dtype=np.int64)
+        counts += np.histogram(a, bins=edges)[0]
+    labels = [str(lo) if hi - lo == 1 else f"{lo}-{hi - 1}"
+              for lo, hi in zip(edges[:-1], edges[1:])]
+    return labels, counts
 
 
 def even_k_sample(df, k: int, *, seed: int = 0, id_col: str = "unique_id"):
@@ -47,11 +95,12 @@ def even_k_sample(df, k: int, *, seed: int = 0, id_col: str = "unique_id"):
     return sub.groupby(id_col, group_keys=False).sample(n=k, random_state=seed)
 
 
-def size_by_position(df, max_pos: int | None = None):
+def size_by_position(df, max_pos: int | None = None, top_k: int = DEFAULT_TOP_K):
     """Per-position nucleus profile across rollouts. Returns ``(mean_size,
     singleton_frac, count)`` numpy arrays indexed by token position (0 = first
     generated token). ``count[i]`` is how many rollouts reached position ``i``, so
-    the deep tail is averaged over fewer, longer rollouts."""
+    the deep tail is averaged over fewer, longer rollouts. Sizes are folded into
+    ``[1, top_k]`` first, so a flat/overflowed position can't skew the mean."""
     import numpy as np
     if max_pos is None:
         max_pos = max((len(a) for a in df["nuc_sizes"]), default=0)
@@ -59,7 +108,7 @@ def size_by_position(df, max_pos: int | None = None):
     sum_singleton = np.zeros(max_pos, dtype=np.int64)
     count = np.zeros(max_pos, dtype=np.int64)
     for arr in df["nuc_sizes"]:
-        a = np.asarray(arr, dtype=np.int64)
+        a = _clip_sizes(np.asarray(arr, dtype=np.int64), top_k)
         n = min(len(a), max_pos)
         sum_size[:n] += a[:n]
         sum_singleton[:n] += (a[:n] == 1)
@@ -110,6 +159,7 @@ def summarize_nuclei(df, *, top_k: int = DEFAULT_TOP_K, band_map: dict | None = 
         a = np.asarray(row.nuc_sizes, dtype=np.int64)
         if a.size == 0:
             continue
+        a = _clip_sizes(a, top_k)
         bc = np.bincount(a, minlength=top_k + 1)[:top_k + 1]
         t1 = int(np.asarray(row.chosen_is_top1, dtype=bool).sum())
         total += bc

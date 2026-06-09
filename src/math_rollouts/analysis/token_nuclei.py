@@ -7,10 +7,14 @@ records the **nucleus size** plus a compact, frugal slice of the distribution:
   * **singletons** (nucleus size 1): keep the top-2 tokens — enough to see whether
     the runner-up had any meaningful mass (a near-miss singleton), without the cost
     of a full distribution. Regenerate to investigate further.
-  * **branches** (size >= 2): keep ``min(max(size, 10), 20)`` tokens — at least 10,
-    so the visualization can show alternates just *outside* the nucleus and a
-    reachability check can tell "outside the nucleus but barely" from "far down";
-    capped at ``top_k`` = 20 (the nucleus can never exceed that anyway).
+  * **branches** (size >= 2): keep ``max(size, 10)`` tokens — at least 10, so the
+    visualization can show alternates just *outside* the nucleus and a reachability
+    check can tell "outside the nucleus but barely" from "far down". The nucleus
+    size is recorded **uncapped** (``top_k=None`` → the true top-p size, which on a
+    flat distribution can run to thousands of tokens), so the kept slice is uncapped
+    too; in practice nuclei are tiny on average, so the store stays small. Because
+    sizes are uncapped, ``nuc_sizes`` and ``keep_counts`` are stored as **int32**
+    (int16 would overflow a >32767-token nucleus to a negative).
 
 Stored per kept entry: the **raw logit** (pre-temperature — recompute any T/prob)
 and the token **id**. Recompute precision is **bfloat16**, matching the vLLM engine
@@ -43,8 +47,9 @@ from typing import Any
 from ..config import GenConfig
 from ..data.hf import load_generation_parquet, load_problems_parquet, model_slug
 
-# Keep-rule (also written to _meta.json). Branch max is top_k (cfg), since the
-# nucleus can never exceed it.
+# Keep-rule (also written to _meta.json). Branches keep >= BRANCH_MIN; there is no
+# upper cap — the nucleus size is recorded uncapped, so a flat-distribution branch
+# can keep (and report a size of) thousands of tokens.
 SINGLETON_KEEP = 2
 BRANCH_MIN = 10
 
@@ -80,9 +85,9 @@ def _sequence_kept(gen_logits, chosen_ids, *, temperature, top_p, top_k,
         keep_n = torch.where(size <= 1, torch.full_like(size, SINGLETON_KEEP),
                              torch.clamp(size, min=BRANCH_MIN))    # max already <= k_eff
         store = torch.arange(k_eff, device=gl.device).unsqueeze(0) < keep_n.unsqueeze(1)
-        sizes_l.append(size.to(torch.int16))
+        sizes_l.append(size.to(torch.int32))   # uncapped (top_k=None) -> can exceed int16
         top1_l.append(top_idx[:, 0] == ch)
-        keepn_l.append(keep_n.to(torch.int16))
+        keepn_l.append(keep_n.to(torch.int32))  # = size for branches, so also uncapped
         ids_l.append(top_idx[store])
         logit_l.append(top_raw[store])
     return (torch.cat(sizes_l).cpu().numpy(), torch.cat(top1_l).cpu().numpy(),
@@ -134,9 +139,9 @@ def _write_shard(path: Path, rows: list[dict], pa_logit) -> None:
         "answer_matches": col("answer_matches", pa.bool_()),
         "dup_index": col("dup_index", pa.int32()),
         "n_tokens": col("n_tokens", pa.int32()),
-        "nuc_sizes": col("nuc_sizes", pa.list_(pa.int16())),
+        "nuc_sizes": col("nuc_sizes", pa.list_(pa.int32())),
         "chosen_is_top1": col("chosen_is_top1", pa.list_(pa.bool_())),
-        "keep_counts": col("keep_counts", pa.list_(pa.int16())),
+        "keep_counts": col("keep_counts", pa.list_(pa.int32())),
         "kept_ids": col("kept_ids", pa.list_(pa.int32())),
         "kept_logits": pa.array([r["kept_logits"].astype(np_logit) for r in rows],
                                 type=pa.list_(pa_logit)),
@@ -240,9 +245,9 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                     "answer_matches": bool(r["answer_matches"]),
                     "dup_index": int(r["dup_index"]) if r.get("dup_index") is not None else None,
                     "n_tokens": int(T),
-                    "nuc_sizes": sizes.astype("int16").tolist(),
+                    "nuc_sizes": sizes.astype("int32").tolist(),
                     "chosen_is_top1": top1.astype(bool).tolist(),
-                    "keep_counts": keepn.astype("int16").tolist(),
+                    "keep_counts": keepn.astype("int32").tolist(),
                     "kept_ids": ids_flat.astype("int32").tolist(),
                     "kept_logits": logit_flat,
                 })

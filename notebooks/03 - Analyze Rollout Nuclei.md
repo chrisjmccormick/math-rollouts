@@ -94,7 +94,7 @@ SEED          = 0
 CI_BAND       = "Hard"
 
 # Only the light columns — skip the bulky kept_ids/kept_logits lists, we only need sizes.
-LIGHT_COLS = ["unique_id", "subject", "sample_idx", "is_correct", "n_tokens",
+LIGHT_COLS = ["unique_id", "subject", "sample_idx", "answer_matches", "n_tokens",
               "nuc_sizes", "chosen_is_top1"]
 ```
 
@@ -114,7 +114,7 @@ import matplotlib.pyplot as plt
 from math_rollouts.data.hf import load_token_nuclei_pool
 from math_rollouts.analysis.difficulty import band_table, BAND_ORDER
 from math_rollouts.analysis.nuclei_stats import (
-    summarize_nuclei, even_k_sample, size_by_position)
+    summarize_nuclei, even_k_sample, size_by_position, size_distribution)
 
 df = load_token_nuclei_pool(MODEL_ID, POOL, columns=LIGHT_COLS)
 print(f"loaded {len(df):,} rollouts across {df.unique_id.nunique()} problems "
@@ -170,22 +170,25 @@ print(f"\n  (raw unbalanced pool singleton: {raw['singleton_frac']*100:.1f}% ove
 
 <!-- md -->
 The size distribution across all generated tokens. The first bar (size 1) is the
-singleton fraction — the headline number for the post.
+singleton fraction — the headline number for the post. Sizes are uncapped (they run
+to tens of thousands on rare flat-distribution positions), so we bin them
+**exact for 1–8, then by octaves** (`9–16`, `17–32`, …) — equal-width categorical
+bars so the long tail stays visible instead of piling into one bar at the cap.
 
 <!-- code -->
 ```python
-hist  = stats["size_histogram"]
-sizes = sorted(hist)
-pct   = [hist[s] / stats["n_tokens"] * 100 for s in sizes]
+labels, counts = size_distribution(bal)
+pct = counts / stats["n_tokens"] * 100
 
-plt.figure(figsize=(8, 4.5))
-bars = plt.bar(sizes, pct, color="#4C72B0")
+plt.figure(figsize=(9, 4.5))
+x = range(len(labels))
+bars = plt.bar(x, pct, color="#4C72B0")
 plt.bar_label(bars, labels=[f"{p:.0f}%" if p >= 1 else "" for p in pct], fontsize=8)
 plt.xlabel("nucleus size (number of tokens sampling could pick)")
 plt.ylabel("% of generated tokens")
 plt.title(f"Nucleus size distribution — {MODEL_ID.split('/')[-1]} / {POOL} (even-K={K_PER_PROBLEM})\n"
           f"{stats['singleton_frac']*100:.1f}% of tokens have a singleton nucleus")
-plt.xticks(sizes)
+plt.xticks(list(x), labels, rotation=45, ha="right")
 plt.tight_layout()
 plt.show()
 ```
@@ -308,7 +311,7 @@ splitting **within a single band**; a residual length gap remains, so read it as
 def ci_table(frame, title):
     rows = []
     for label in ("correct", "incorrect"):
-        sub = frame[frame.is_correct] if label == "correct" else frame[~frame.is_correct]
+        sub = frame[frame.answer_matches] if label == "correct" else frame[~frame.answer_matches]
         if not len(sub):
             continue
         s = summarize_nuclei(sub)
