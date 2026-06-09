@@ -19,7 +19,8 @@ def generate_natural(model_id: str, problems: list[dict], *, k,
                      cfg: GenConfig | None = None, device: str = "cuda",
                      llm=None, tok=None) -> list[dict]:
     """Natural-sample completions for ``problems`` and return RAW rollout rows
-    (``ROLLOUTS_SCHEMA``; NO correctness — score with ``data.pools.score_rollouts``).
+    (``ROLLOUTS_SCHEMA``; NO answer/match facts — those are added when the pool is
+    built via ``data.pools.build_pool`` / ``compute_raw_attributes``).
 
     ``k`` is either an int (same number of samples for every problem) or a
     ``dict[unique_id, int]`` of per-problem sample counts — the latter drives a
@@ -53,14 +54,17 @@ def generate_natural(model_id: str, problems: list[dict], *, k,
             kw["seed"] = seed
         return SamplingParams(**kw)
 
-    prompts, sps, owners = [], [], []
+    eos_id = tok.eos_token_id
+    prompts, sps, owners, prompt_lens = [], [], [], []
     for p in problems:
         n = _n_for(p["unique_id"])
         if n <= 0:
             continue
-        prompts.append({"prompt_token_ids": adapter.prompt_ids(p, tok)})
+        pids = adapter.prompt_ids(p, tok)
+        prompts.append({"prompt_token_ids": pids})
         sps.append(_sp(n))
         owners.append(p)
+        prompt_lens.append(len(pids))
     total = sum(sp.n for sp in sps)
     print(f"[generate_natural] {len(prompts)} problems -> {total} rollouts "
           f"(run_id={run_id}, seed={seed}) ...", flush=True)
@@ -69,11 +73,16 @@ def generate_natural(model_id: str, problems: list[dict], *, k,
     # vLLM accepts a per-prompt list of SamplingParams (variable n per problem).
     outs = llm.generate(prompts, sps if isinstance(k, dict) else sps[0])
 
+    from ..score.scorers import derive_terminal
+
     gcid = cfg.gen_config_id()
     rollouts: list[dict] = []
-    for p, o in zip(owners, outs):
+    for p, plen, o in zip(owners, prompt_lens, outs):
         for j, c in enumerate(o.outputs):
             ids = list(c.token_ids)
+            stop_reason = None if c.stop_reason is None else str(c.stop_reason)
+            # vLLM returns the trailing EOS as the final id; exclude it from the count.
+            comp_n = len(ids) - 1 if (ids and ids[-1] == eos_id) else len(ids)
             rollouts.append({
                 "model_id": model_id,
                 "unique_id": p["unique_id"],
@@ -91,8 +100,12 @@ def generate_natural(model_id: str, problems: list[dict], *, k,
                 "sample_idx": j,
                 "completion_token_ids": ids,
                 "completion_text": c.text,
-                "num_tokens": len(ids),
                 "finish_reason": c.finish_reason,
+                "stop_reason": stop_reason,
+                "terminal": derive_terminal(c.finish_reason, stop_reason),
+                "prompt_num_tokens": plen,
+                "completion_num_tokens": comp_n,
+                "total_num_tokens": plen + comp_n,
             })
     print(f"[generate_natural] done: {len(rollouts)} raw rollout rows", flush=True)
     return rollouts

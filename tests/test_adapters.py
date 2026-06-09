@@ -62,17 +62,42 @@ def test_thinking_scoring_post_think_only():
     assert check_correct_post_think("no close token \\boxed{42}", "42") is False
 
 
-def test_default_scorer_gates_on_finish_reason():
-    scorer = get_scorer("boxed-match-stop-v1")
+def test_answer_match_is_truncation_tolerant():
+    # DEFAULT scorer: correct iff answer_matches, regardless of how it terminated.
+    scorer = get_scorer("answer-match")
     base_row = dict(model_id="M", unique_id="u", run_id=0, branch_path=[0],
                     sample_idx=0, completion_text="x \\boxed{42}", answer="42")
-    assert scorer.score_row({**base_row, "finish_reason": "stop"})["is_correct"] is True
-    # correct text but truncated (length) -> not a keeper under the default scorer.
-    assert scorer.score_row({**base_row, "finish_reason": "length"})["is_correct"] is False
+    assert scorer.score_row({**base_row, "finish_reason": "stop"})["verdict"] == "correct"
+    # truncated but the answer matched -> still correct (no termination gate).
+    assert scorer.score_row({**base_row, "finish_reason": "length"})["verdict"] == "correct"
 
 
-def test_ungated_scorer_ignores_finish_reason():
-    scorer = get_scorer("boxed-match-v1")
-    row = dict(model_id="M", unique_id="u", run_id=0, branch_path=[0], sample_idx=0,
-               completion_text="x \\boxed{42}", answer="42", finish_reason="length")
-    assert scorer.score_row(row)["is_correct"] is True
+def test_boxed_match_requires_a_box():
+    scorer = get_scorer("boxed-match")
+    boxed = dict(model_id="M", unique_id="u", run_id=0, branch_path=[0], sample_idx=0,
+                 completion_text="x \\boxed{42}", answer="42", finish_reason="length")
+    assert scorer.score_row(boxed)["verdict"] == "correct"
+    # right answer but NO box -> incorrect under the box-gated scorer.
+    nobox = {**boxed, "completion_text": "the answer is 42"}
+    r = scorer.score_row(nobox)
+    assert r["answer_matches"] is True and r["has_boxed"] is False
+    assert r["verdict"] == "incorrect"
+
+
+def test_benchmark_budget_gates_on_termination_and_strict_raises():
+    import pytest as _pytest
+    base = dict(model_id="M", unique_id="u", run_id=0, branch_path=[0], sample_idx=0,
+                completion_text="x \\boxed{42}", answer="42")
+    sc = get_scorer("benchmark@budget=8192")
+    # correct AND naturally terminated -> correct.
+    assert sc.score_row({**base, "finish_reason": "stop", "max_gen_len": 3000})["verdict"] == "correct"
+    # truncated below budget -> unresolved; strict mode raises.
+    with _pytest.raises(ValueError, match="UNRESOLVED|unresolved|budget"):
+        sc.score_row({**base, "finish_reason": "length", "max_gen_len": 3000})
+    # non-strict records 'unresolved' instead of raising.
+    sc_lax = get_scorer("benchmark@budget=8192", strict=False)
+    assert sc_lax.score_row({**base, "finish_reason": "length",
+                             "max_gen_len": 3000})["verdict"] == "unresolved"
+    # truncated but the pool already met the budget -> a clean incorrect.
+    assert sc.score_row({**base, "finish_reason": "length",
+                         "max_gen_len": 8192})["verdict"] == "incorrect"

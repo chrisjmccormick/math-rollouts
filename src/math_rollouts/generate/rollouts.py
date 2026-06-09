@@ -71,6 +71,7 @@ def force_rollouts(llm, tok, adapter, nuclei_rows, problems, cfg: GenConfig, *,
     from vllm import SamplingParams
 
     prompt_by_uid = _prompt_ids_by_uid(adapter, tok, problems)
+    eos_id = tok.eos_token_id
     sp_kwargs = dict(n=k, temperature=cfg.temperature, top_p=cfg.top_p,
                      max_tokens=cfg.max_tokens, stop=adapter.vllm_stop())
     if seed is not None:
@@ -87,13 +88,20 @@ def force_rollouts(llm, tok, adapter, nuclei_rows, problems, cfg: GenConfig, *,
           f"{len(prompts) * k} rollouts ...", flush=True)
     outs = llm.generate(prompts, sp)
 
+    from ..score.scorers import derive_terminal
+
     gcid = cfg.gen_config_id()
     rollouts: list[dict] = []
     for n, o in zip(owners, outs):
         opener_ids = list(n["opener_token_ids"])
         opener_str = "".join(n["opener_token_strs"])
+        # the forced opener is re-prepended into the stored completion, so the prompt
+        # is the prefix only (counting the opener here would double-count it).
+        plen = len(prompt_by_uid[n["unique_id"]])
         for j, c in enumerate(o.outputs):
             full_ids = opener_ids + list(c.token_ids)   # incl. the forced opener
+            stop_reason = None if c.stop_reason is None else str(c.stop_reason)
+            comp_n = len(full_ids) - 1 if (full_ids and full_ids[-1] == eos_id) else len(full_ids)
             rollouts.append({
                 "model_id": adapter.model_id,
                 "unique_id": n["unique_id"],
@@ -111,8 +119,12 @@ def force_rollouts(llm, tok, adapter, nuclei_rows, problems, cfg: GenConfig, *,
                 "sample_idx": j,
                 "completion_token_ids": full_ids,
                 "completion_text": opener_str + c.text,
-                "num_tokens": len(full_ids),
                 "finish_reason": c.finish_reason,
+                "stop_reason": stop_reason,
+                "terminal": derive_terminal(c.finish_reason, stop_reason),
+                "prompt_num_tokens": plen,
+                "completion_num_tokens": comp_n,
+                "total_num_tokens": plen + comp_n,
             })
     print(f"[force_rollouts] done: {len(rollouts)} raw rollout rows", flush=True)
     return rollouts

@@ -20,10 +20,10 @@ def _nuclei():
 
 def _scored_full():
     return pd.DataFrame([
-        dict(unique_id="p1", branch_path=[0], is_correct=True),
-        dict(unique_id="p1", branch_path=[0], is_correct=False),
-        dict(unique_id="p1", branch_path=[1], is_correct=True),
-        dict(unique_id="p2", branch_path=[0], is_correct=True),
+        dict(unique_id="p1", branch_path=[0], answer_matches=True),
+        dict(unique_id="p1", branch_path=[0], answer_matches=False),
+        dict(unique_id="p1", branch_path=[1], answer_matches=True),
+        dict(unique_id="p2", branch_path=[0], answer_matches=True),
     ])
 
 

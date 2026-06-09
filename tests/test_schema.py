@@ -6,6 +6,7 @@ import pyarrow as pa
 from math_rollouts.schema import (
     GROUP_KEY,
     NUCLEI_SCHEMA,
+    POOL_SCHEMA,
     ROLLOUT_KEY,
     ROLLOUTS_SCHEMA,
     SCORES_SCHEMA,
@@ -33,6 +34,29 @@ def test_rollouts_has_no_correctness():
     assert _dtype(ROLLOUTS_SCHEMA, "completion_token_ids") == pa.list_(pa.int32())
 
 
+def test_rollouts_carries_termination_and_lengths():
+    names = set(ROLLOUTS_SCHEMA.names)
+    # vLLM/OpenAI termination fields + the derived enum.
+    assert {"finish_reason", "stop_reason", "terminal"} <= names
+    # EOS-excluded lengths; the legacy num_tokens is renamed.
+    assert {"prompt_num_tokens", "completion_num_tokens", "total_num_tokens"} <= names
+    assert "num_tokens" not in names
+    # raw rows do NOT carry the answer/match facts (those are pool/scores attributes).
+    assert "answer_matches" not in names and "has_boxed" not in names
+
+
+def test_pool_schema_is_rollouts_plus_criterion_free_facts():
+    names = set(POOL_SCHEMA.names)
+    assert set(ROLLOUTS_SCHEMA.names) <= names                # superset of raw rollouts
+    assert {"answer_matches", "has_boxed", "answer_char_pos",
+            "answer_token_frac", "dup_index"} <= names
+    # no baked verdict / scorer on the pool — facts only.
+    assert "is_correct" not in names and "scorer_id" not in names
+    assert _dtype(POOL_SCHEMA, "answer_matches") == pa.bool_()
+    assert _dtype(POOL_SCHEMA, "has_boxed") == pa.bool_()
+    assert _dtype(POOL_SCHEMA, "dup_index") == pa.int32()
+
+
 def test_single_split_aware_id():
     # The second id is gone; unique_id (split-aware) is the only problem identity.
     assert "math500_native_id" not in NUCLEI_SCHEMA.names
@@ -41,7 +65,11 @@ def test_single_split_aware_id():
 
 
 def test_scores_dtypes_and_join_keys():
-    assert _dtype(SCORES_SCHEMA, "is_correct") == pa.bool_()
+    # the scored verdict is a 3-valued string (correct/incorrect/unresolved), not a
+    # baked is_correct boolean; the criterion-free answer_matches fact rides along.
+    assert "is_correct" not in SCORES_SCHEMA.names
+    assert _dtype(SCORES_SCHEMA, "verdict") == pa.string()
+    assert _dtype(SCORES_SCHEMA, "answer_matches") == pa.bool_()
     assert ROLLOUT_KEY == ["model_id", "unique_id", "run_id", "branch_path", "sample_idx"]
     assert GROUP_KEY == ["model_id", "unique_id", "branch_path", "run_id"]
     # every join/group key must exist in the tables that need it.

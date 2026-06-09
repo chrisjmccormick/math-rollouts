@@ -1,13 +1,16 @@
-"""Flat, self-contained rollout POOLS — assemble, score, count, extend.
+"""Flat, self-contained rollout POOLS — assemble, annotate, count, extend.
 
-A pool is *scored natural rollouts in the canonical schema* (``schema.POOL_SCHEMA`` =
-``ROLLOUTS_SCHEMA`` + ``is_correct`` + ``scorer_id``), stored as a single
-``generations/<model-slug>/<pool>.parquet`` with an ``is_correct`` inline (labeled by
-``scorer_id``) and per-batch provenance in a ``<pool>.meta.json`` sidecar.
+A pool is *natural rollouts in the canonical schema* (``schema.POOL_SCHEMA`` =
+``ROLLOUTS_SCHEMA`` + the criterion-free answer/match facts + ``dup_index``), stored
+as a single ``generations/<model-slug>/<pool>.parquet`` with per-batch provenance in
+a ``<pool>.meta.json`` sidecar. There is NO baked ``is_correct`` boolean: the pool
+records the *facts* (``answer_matches``, ``has_boxed``, answer placement, termination,
+lengths). Accuracy / difficulty bands are reproduced by a NAMED scorer over those
+facts (default ``answer-match`` == the ``answer_matches`` column).
 
 CPU only. Generation (``generate.natural.generate_natural``) produces the raw rows;
-these helpers score them, conform them to ``POOL_SCHEMA``, and support the
-width-extend (top every problem up to a target K) by computing per-problem deficits.
+these helpers compute the answer/match attributes, conform to ``POOL_SCHEMA``, assign
+``dup_index``, and support the width-extend (top every problem up to a target K).
 """
 from __future__ import annotations
 
@@ -16,40 +19,124 @@ from pathlib import Path
 
 from ..schema import POOL_SCHEMA, ROLLOUT_KEY, table_from_rows
 
+# Columns added on top of the raw rollout facts to make a pool.
+_POOL_ATTRS = ["answer_matches", "has_boxed", "answer_char_pos", "answer_token_frac",
+               "terminal", "stop_reason", "completion_num_tokens", "prompt_num_tokens",
+               "total_num_tokens"]
+
 
 def default_scorer_id(model_id: str) -> str:
-    """Canonical scorer for a model family: post-think for thinking models (so
-    'did </think> close' is handled by the scorer, not a schema column), else the
-    boxed-match gate."""
+    """The default REPORTING scorer for a model family (provenance only — the pool
+    bakes no verdict). ``post-think-v1`` for thinking models (so 'did </think> close'
+    is handled by the scorer), else the permissive ``answer-match``."""
     from ..adapters import get_adapter
-    return "post-think-v1" if get_adapter(model_id).is_thinking else "boxed-match-stop-v1"
+    return "post-think-v1" if get_adapter(model_id).is_thinking else "answer-match"
 
 
-def score_rollouts(rows: list[dict], *, scorer_id: str | None = None,
-                   model_id: str | None = None) -> tuple[list[bool], str]:
-    """Score raw rollout rows in memory. Returns ``(is_correct_list, scorer_id)``.
-    ``scorer_id`` defaults to the model's canonical scorer."""
-    from ..score.scorers import get_scorer
-    if not rows:
-        return [], scorer_id or "boxed-match-stop-v1"
-    scorer_id = scorer_id or default_scorer_id(model_id or rows[0]["model_id"])
-    scorer = get_scorer(scorer_id)
-    return [bool(scorer.score_row(r)["is_correct"]) for r in rows], scorer_id
+def _eos_excluded_count(token_ids, eos_id) -> int:
+    """Response length excluding a single trailing EOS token (vLLM returns EOS as the
+    final id of ``completion_token_ids``; a truncated rollout has none)."""
+    n = len(token_ids)
+    if eos_id is not None and n and token_ids[-1] == eos_id:
+        return n - 1
+    return n
 
 
-def to_pool_frame(rows: list[dict], is_correct: list[bool], scorer_id: str):
-    """Conform raw rollout rows + their verdicts to ``POOL_SCHEMA`` (a pandas
-    DataFrame). Missing canonical fields are filled null; extra legacy fields dropped."""
-    merged = [{**r, "is_correct": bool(c), "scorer_id": scorer_id}
-              for r, c in zip(rows, is_correct)]
-    return table_from_rows(merged, POOL_SCHEMA).to_pandas()
+def row_attributes(row: dict, *, tok=None, prompt_len=None, eos_id=None) -> dict:
+    """Criterion-free raw attributes for ONE rollout row. Pure (no shared state), so
+    it is reused both serially and by the parallel migration workers.
+
+    Prefers facts already present on the row (e.g. ``terminal``/lengths stamped at
+    generation) and computes the rest: ``answer_matches`` (permissive full-text
+    math_verify), ``has_boxed``, the verified-answer char position + token fraction,
+    the termination enum, and the EOS-excluded lengths. ``prompt_len`` is this
+    problem's ``prompt_num_tokens`` (needed for total + token-fraction denominator)."""
+    from ..analysis.positional import has_boxed, verified_answer_char_pos
+    from ..score.scorers import answer_matches as _answer_matches, derive_terminal
+
+    text, answer = row["completion_text"], row["answer"]
+    am = bool(_answer_matches(text, answer))
+    hb = bool(has_boxed(text))
+    pos = verified_answer_char_pos(text, answer)
+    cti = row.get("completion_token_ids")
+    ids = list(cti) if cti is not None else []
+
+    comp_n = row.get("completion_num_tokens")
+    if comp_n is None:
+        comp_n = _eos_excluded_count(ids, eos_id)
+    comp_n = int(comp_n)
+
+    p_n = row.get("prompt_num_tokens")
+    if p_n is None:
+        p_n = prompt_len
+    p_n = int(p_n) if p_n is not None else None
+
+    frac = row.get("answer_token_frac")
+    if frac is None and pos is not None and tok is not None:
+        n_before = len(tok.encode(text[:pos], add_special_tokens=False))
+        frac = n_before / max(comp_n, 1)
+
+    terminal = row.get("terminal") or derive_terminal(row.get("finish_reason"),
+                                                       row.get("stop_reason"))
+    total_n = row.get("total_num_tokens")
+    if total_n is None and p_n is not None:
+        total_n = p_n + comp_n
+
+    return {
+        "answer_matches": am,
+        "has_boxed": hb,
+        "answer_char_pos": int(pos) if pos is not None else None,
+        "answer_token_frac": float(frac) if frac is not None else None,
+        "terminal": terminal,
+        "stop_reason": row.get("stop_reason"),
+        "completion_num_tokens": comp_n,
+        "prompt_num_tokens": p_n,
+        "total_num_tokens": int(total_n) if total_n is not None else None,
+    }
 
 
-def build_pool(rows: list[dict], *, scorer_id: str | None = None,
-               model_id: str | None = None):
-    """Score + conform in one step. Returns ``(pool_df, scorer_id)``."""
-    verdicts, sid = score_rollouts(rows, scorer_id=scorer_id, model_id=model_id)
-    return to_pool_frame(rows, verdicts, sid), sid
+def compute_raw_attributes(rows: list[dict], *, tok=None,
+                           prompt_len: dict | None = None, eos_id=None) -> list[dict]:
+    """Annotate raw rollout rows with the criterion-free pool attributes (serial).
+    ``prompt_len`` maps ``unique_id -> prompt_num_tokens``."""
+    pl = prompt_len or {}
+    return [{**r, **row_attributes(r, tok=tok, prompt_len=pl.get(r.get("unique_id")),
+                                   eos_id=eos_id)} for r in rows]
+
+
+def add_dup_index(df):
+    """Assign ``dup_index``: 0 for the first occurrence of an identical completion
+    within a problem, 1,2,... for natural repeats. Identity is the exact
+    ``completion_token_ids`` sequence (the precise notion of a distinct completion).
+    Deterministic order by ``(unique_id, run_id, sample_idx)``. Duplicate completions
+    are KEPT (legitimate near-deterministic behaviour + needed for pass@k); the flag
+    lets analysis filter to distinct completions (``dup_index == 0``)."""
+    d = df.copy()
+    d["_ord"] = range(len(d))
+    d["_cid"] = d["completion_token_ids"].map(
+        lambda x: tuple(int(t) for t in x) if x is not None else ())
+    sort_cols = [c for c in ("unique_id", "run_id", "sample_idx") if c in d.columns]
+    d = d.sort_values(sort_cols + ["_ord"], kind="stable")
+    d["dup_index"] = d.groupby(["unique_id", "_cid"]).cumcount().astype("int32")
+    d = d.sort_values("_ord", kind="stable").drop(columns=["_ord", "_cid"])
+    return d.reset_index(drop=True)
+
+
+def to_pool_frame(rows: list[dict]):
+    """Conform annotated rollout rows to ``POOL_SCHEMA`` (a pandas DataFrame), filling
+    ``dup_index`` if not already present on the rows. Rows must already carry the raw
+    attributes (run ``compute_raw_attributes`` / ``row_attributes`` first)."""
+    df = table_from_rows(rows, POOL_SCHEMA).to_pandas()
+    if "dup_index" not in df.columns or df["dup_index"].isna().all():
+        df = add_dup_index(df)
+    return df
+
+
+def build_pool(rows: list[dict], *, model_id: str | None = None, tok=None,
+               prompt_len: dict | None = None, eos_id=None):
+    """Annotate raw rollout rows + conform to ``POOL_SCHEMA`` in one step."""
+    annotated = compute_raw_attributes(rows, tok=tok, prompt_len=prompt_len, eos_id=eos_id)
+    return to_pool_frame(annotated)
 
 
 def pool_counts(df, id_col: str = "unique_id"):
@@ -85,7 +172,9 @@ def _key_tuples(df):
 def extend_pool(existing, new):
     """Append ``new`` pool rows to ``existing`` (both ``POOL_SCHEMA`` DataFrames),
     dropping any rows whose ``ROLLOUT_KEY`` already exists (so re-runs are
-    idempotent). Returns the combined DataFrame."""
+    idempotent). Returns the combined DataFrame. NOTE: this de-dups on the rollout
+    KEY (same problem/run/sample), NOT on completion content — duplicate completions
+    across distinct samples are deliberately kept (see ``add_dup_index``)."""
     import pandas as pd
     if existing is None or not len(existing):
         return new.reset_index(drop=True)
@@ -95,47 +184,55 @@ def extend_pool(existing, new):
 
 
 def is_canonical(df) -> bool:
-    """True if ``df`` already carries the canonical pool columns (vs a legacy pool)."""
-    return {"scorer_id", "is_correct"} <= set(getattr(df, "columns", []))
+    """True if ``df`` already carries the canonical pool facts (vs a legacy pool)."""
+    return "answer_matches" in set(getattr(df, "columns", []))
 
 
-def ensure_pool_schema(df, model_id: str | None = None, *, scorer_id: str | None = None):
+def ensure_pool_schema(df, model_id: str | None = None, *, tok=None,
+                       prompt_len: dict | None = None, eos_id=None):
     """Return ``df`` as a canonical-schema pool: a no-op (column reorder) if already
-    canonical, else migrate a legacy pool in place (re-scoring ``is_correct``). Lets
+    canonical, else migrate a legacy pool (compute the answer/match attributes). Lets
     the extend path work regardless of whether a pool has been migrated yet."""
     if is_canonical(df):
-        from ..schema import POOL_SCHEMA
         return df[[c for c in POOL_SCHEMA.names if c in df.columns]]
-    pool_df, _ = migrate_legacy_pool(df, scorer_id=scorer_id, model_id=model_id)
-    return pool_df
+    return migrate_legacy_pool(df, model_id=model_id, tok=tok, prompt_len=prompt_len,
+                               eos_id=eos_id)
 
 
-def migrate_legacy_pool(legacy_df, *, scorer_id: str | None = None,
-                        model_id: str | None = None):
-    """Project a legacy dev-project pool DataFrame onto ``POOL_SCHEMA`` and re-score.
+def migrate_legacy_pool(legacy_df, *, model_id: str | None = None, tok=None,
+                        prompt_len: dict | None = None, eos_id=None):
+    """Project a legacy pool DataFrame onto ``POOL_SCHEMA`` and compute the raw
+    answer/match attributes + ``dup_index``.
 
-    Drops the baggage columns (kept only ``POOL_SCHEMA`` fields), fills the natural-
+    Drops the baggage columns (keeps only ``POOL_SCHEMA`` fields), fills the natural-
     sampling opener fields (``depth=0, branch_path=[], opener_token_ids=[]``), and
-    recomputes ``is_correct`` from ``completion_text`` with the canonical scorer.
-    Returns ``(pool_df, scorer_id)``."""
+    derives ``answer_matches``/``has_boxed``/placement/termination/lengths from
+    ``completion_text`` + the vLLM fields. A pre-existing ``dup_index`` (e.g. on an
+    already-deduped-flag pool) is preserved. Returns a pandas DataFrame."""
     rows = legacy_df.to_dict("records")
     for r in rows:
         r.setdefault("depth", 0)
         r["branch_path"] = list(r.get("branch_path") or [])
         r["opener_token_ids"] = list(r.get("opener_token_ids") or [])
-    verdicts, sid = score_rollouts(rows, scorer_id=scorer_id, model_id=model_id)
-    return to_pool_frame(rows, verdicts, sid), sid
+    annotated = compute_raw_attributes(rows, tok=tok, prompt_len=prompt_len, eos_id=eos_id)
+    df = table_from_rows(annotated, POOL_SCHEMA).to_pandas()
+    if "dup_index" in legacy_df.columns:
+        df["dup_index"] = legacy_df["dup_index"].astype("int32").to_numpy()
+    else:
+        df = add_dup_index(df)
+    return df
 
 
 def pool_drift_report(legacy_df, migrated_df, id_col: str = "unique_id") -> dict:
-    """Compare legacy vs re-scored ``is_correct``: per-rollout flip counts and how many
-    problems change difficulty band (band = base-model solve-rate bucket)."""
+    """Compare legacy ``is_correct`` vs the re-derived ``answer_matches``: per-rollout
+    flip counts and how many problems change difficulty band (band = base-model
+    solve-rate bucket under the default ``answer-match`` verdict)."""
     from ..analysis.difficulty import assign_band
     old = legacy_df["is_correct"].reset_index(drop=True).astype(bool)
-    new = migrated_df["is_correct"].reset_index(drop=True).astype(bool)
+    new = migrated_df["answer_matches"].reset_index(drop=True).astype(bool)
     flips = (old != new)
     old_band = legacy_df.groupby(id_col)["is_correct"].mean().map(assign_band)
-    new_band = migrated_df.groupby(id_col)["is_correct"].mean().map(assign_band)
+    new_band = migrated_df.groupby(id_col)["answer_matches"].mean().map(assign_band)
     band_moved = (old_band != new_band.reindex(old_band.index))
     return {
         "n_rollouts": int(len(old)),
@@ -147,13 +244,29 @@ def pool_drift_report(legacy_df, migrated_df, id_col: str = "unique_id") -> dict
     }
 
 
-def refresh_shard_is_correct(shard_df, pool_df):
-    """Update a ``*_token_nuclei`` shard's copied ``is_correct`` from a (re-scored)
-    pool, joining on ``(unique_id, run_id, sample_idx)``. Returns a new DataFrame."""
+def refresh_shard_answer_matches(shard_df, pool_df):
+    """Update a ``*_token_nuclei`` shard's copied correctness from a (re-derived) pool:
+    replace the legacy ``is_correct`` column with ``answer_matches`` and attach
+    ``dup_index``, joining on ``(unique_id, run_id, sample_idx)``. Returns a new
+    DataFrame preserving the shard's column order (``is_correct`` slot becomes
+    ``answer_matches``; ``dup_index`` appended)."""
     key = ["unique_id", "run_id", "sample_idx"]
-    truth = pool_df[key + ["is_correct"]].drop_duplicates(key)
-    out = shard_df.drop(columns=["is_correct"]).merge(truth, on=key, how="left")
-    return out[list(shard_df.columns)]
+    truth = pool_df[key + ["answer_matches", "dup_index"]].drop_duplicates(key)
+    base = shard_df.drop(columns=[c for c in ("is_correct", "answer_matches", "dup_index")
+                                  if c in shard_df.columns])
+    out = base.merge(truth, on=key, how="left")
+    order = []
+    for c in shard_df.columns:
+        if c == "is_correct":
+            order.append("answer_matches")
+        elif c in ("answer_matches", "dup_index"):
+            continue
+        else:
+            order.append(c)
+    if "answer_matches" not in order:
+        order.append("answer_matches")
+    order.append("dup_index")
+    return out[order]
 
 
 def write_pool(df, path: str | Path) -> Path:
@@ -166,17 +279,23 @@ def write_pool(df, path: str | Path) -> Path:
     return path
 
 
-def write_pool_meta(path: str | Path, *, model_id: str, pool: str, scorer_id: str,
-                    gen_config: dict, runs: list[dict], df=None) -> Path:
+def write_pool_meta(path: str | Path, *, model_id: str, pool: str,
+                    default_reporting_scorer: str, gen_config: dict,
+                    runs: list[dict], df=None) -> Path:
     """Write the ``<pool>.meta.json`` provenance sidecar next to a pool parquet.
-    ``runs`` is a list of per-batch dicts (run_id, cohort, k, seed, n_rollouts, ...)."""
+    ``runs`` is a list of per-batch dicts (run_id, cohort, k, seed, n_rollouts, ...).
+    The pool stores raw facts only; ``default_reporting_scorer`` records which named
+    scorer reproduces the headline accuracy (``answer-match``)."""
     path = Path(path)
     meta = {
         "model_id": model_id, "pool": pool, "schema": "POOL_SCHEMA",
-        "scorer_id": scorer_id, "gen_config": gen_config, "runs": runs,
+        "default_reporting_scorer": default_reporting_scorer,
+        "gen_config": gen_config, "runs": runs,
     }
     if df is not None:
         meta["n_rollouts"] = int(len(df))
         meta["n_problems"] = int(df["unique_id"].nunique())
+        if "dup_index" in df.columns:
+            meta["n_distinct_completions"] = int((df["dup_index"] == 0).sum())
     path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     return path

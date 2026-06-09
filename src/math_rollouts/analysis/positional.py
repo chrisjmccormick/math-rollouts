@@ -52,6 +52,22 @@ def _iter_boxed(text: str):
         i = idx + len(key)
 
 
+def has_boxed(text: str) -> bool:
+    """True iff a *closing* ``\\boxed{...}`` is present (brace-matched). A box cut off
+    by truncation before its closing ``}`` does not count."""
+    key = "\\boxed{"
+    i = text.find(key)
+    while i != -1:
+        depth, j = 1, i + len(key)
+        while j < len(text) and depth:
+            depth += (text[j] == "{") - (text[j] == "}")
+            j += 1
+        if depth == 0:                 # found a matching closing brace
+            return True
+        i = text.find(key, i + len(key))
+    return False
+
+
 def verified_answer_char_pos(text: str, answer: str):
     """Earliest char offset where the CORRECT answer is asserted, or None."""
     answer = str(answer)
@@ -77,9 +93,10 @@ def answer_token_frac(text, token_ids, answer, tokenizer):
     return n_before / max(len(token_ids), 1)
 
 
-def classify(is_correct, frac, keep_frac=KEEP_FRAC):
-    """Return one of: 'incorrect', 'unlocated', 'leak', 'keeper'."""
-    if not is_correct:
+def classify(matches, frac, keep_frac=KEEP_FRAC):
+    """Return one of: 'incorrect', 'unlocated', 'leak', 'keeper'. ``matches`` is the
+    permissive ``answer_matches`` fact (a correct match this far through)."""
+    if not matches:
         return "incorrect"
     if frac is None:
         return "unlocated"

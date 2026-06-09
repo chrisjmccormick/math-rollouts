@@ -24,7 +24,7 @@ from .difficulty import BAND_ORDER
 UNKNOWN_BAND = "Unknown"
 
 
-def per_problem(df, *, id_col: str = "unique_id", correct_col: str = "is_correct",
+def per_problem(df, *, id_col: str = "unique_id", correct_col: str = "answer_matches",
                 run_ids=None):
     """Per-problem integer tallies for one cohort: ``id_col, subject, n_correct, n``.
 
@@ -143,7 +143,7 @@ def main() -> None:
 
     Bands by ``--band-model`` (resolved through ``difficulty.band_table`` against the
     dataset's natural-gen pools) and compares one or more ``--cohort LABEL=PATH``
-    parquets (each carrying ``is_correct``, ``unique_id``, ``subject``)."""
+    parquets (each carrying ``answer_matches``, ``unique_id``, ``subject``)."""
     import argparse
     from pathlib import Path
 
@@ -156,7 +156,7 @@ def main() -> None:
                     help="model_id whose solve-rate defines difficulty bands")
     ap.add_argument("--cohort", action="append", required=True,
                     metavar="LABEL=PATH[#RUN_ID[,RUN_ID...]]",
-                    help="labeled parquet (is_correct+unique_id+subject); repeatable. "
+                    help="labeled parquet (answer_matches+unique_id+subject); repeatable. "
                          "Append #RUN_ID to select a batch when the file bundles several "
                          "(e.g. a baseline run + a pass@k expansion).")
     ap.add_argument("--data-root", default=None, help="local dataset root for banding")

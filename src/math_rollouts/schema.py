@@ -8,10 +8,12 @@ thinking models:
   scores.parquet    DERIVED, re-runnable — one row per (rollout x scorer).
 
 Grouping / statistics. The "these K were generated together" group key is
-``(model_id, unique_id, branch_path, run_id)``; ``accuracy = sum(is_correct) /
+``(model_id, unique_id, branch_path, run_id)``; ``accuracy = sum(answer_matches) /
 group_size`` where ``group_size`` is the row count for that key (never stored as a
-fragile count). ``run_id`` + ``gen_config_id`` + ``seed`` mark BATCH IDENTITY so
-pooling across batches is deliberate, never accidental.
+fragile count) — and ``answer_matches`` is the criterion-free DEFAULT verdict (the
+``answer-match`` scorer), reproduced from a named scorer, never a baked
+``is_correct`` boolean. ``run_id`` + ``gen_config_id`` + ``seed`` mark BATCH IDENTITY
+so pooling across batches is deliberate, never accidental.
 
 Depth-1 parity with the legacy ``openings_k16`` recipe: with ``max_depth=1``,
 ``branch_path == [i]`` and ``opener_token_ids[-1]`` reproduce the old ``token_id``.
@@ -59,26 +61,40 @@ ROLLOUTS_SCHEMA = pa.schema([
     ("seed", pa.int64()),                      # nullable
     ("temperature", pa.float32()),
     ("top_p", pa.float32()),
-    ("max_gen_len", _I32),
+    ("max_gen_len", _I32),                     # generation budget (load-bearing for benchmark@budget)
     ("sample_idx", _I16),                      # 0..K-1 within the group
-    ("completion_token_ids", pa.list_(_I32)),  # full response incl. forced opener
+    ("completion_token_ids", pa.list_(_I32)),  # full response incl. forced opener AND trailing EOS
     ("completion_text", pa.string()),
-    ("num_tokens", _I32),
-    ("finish_reason", pa.string()),            # stop | length
+    # --- termination (vLLM/OpenAI fields verbatim + one derived label) ---
+    ("finish_reason", pa.string()),            # stop | length | abort | error | repetition
+    ("stop_reason", pa.string()),              # null=natural EOS; else matched stop-string/-id (stringified)
+    ("terminal", pa.string()),                 # derived: emitted_eos/stop_string/truncated/repetition/aborted/error
+    # --- lengths (EOS token EXCLUDED from the response count) ---
+    ("prompt_num_tokens", _I32),               # tokens in the rendered prompt
+    ("completion_num_tokens", _I32),           # response length, EXCLUDING the trailing EOS token
+    ("total_num_tokens", _I32),                # prompt + completion (EOS-excluded)
 ])
 
-# A natural-sampled POOL is just scored rollouts: the canonical rollout schema plus
-# an inline correctness verdict and the id of the scorer that produced it. Natural
-# rows carry depth=0, branch_path=[], opener_token_ids=[] (no forced opener) so a pool
-# and a forced-opener experiment share one schema and could be concatenated. This is
-# the single, clean definition that replaces the legacy dev-project pool columns
-# (problem_idx / producer / initial_num_tokens / think-segmentation / timestamp /
-# level were dropped; level/answer/subject are recoverable from the problems table,
-# but answer+subject stay denormalized as in ROLLOUTS_SCHEMA).
+# A natural-sampled POOL is raw rollouts PLUS the criterion-free answer/match
+# attributes (NO baked correctness boolean): the canonical rollout schema + the
+# permissive ``answer_matches`` fact, ``has_boxed``, the verified-answer placement,
+# and ``dup_index``. Difficulty bands / accuracy are reproduced by a NAMED scorer
+# over these facts (default ``answer-match`` == ``answer_matches``), never read off a
+# stored verdict. Natural rows carry depth=0, branch_path=[], opener_token_ids=[] (no
+# forced opener) so a pool and a forced-opener experiment share one schema and could
+# be concatenated. Replaces the legacy dev-project pool columns (problem_idx /
+# producer / initial_num_tokens / think-segmentation / timestamp / level were
+# dropped; level/answer/subject are recoverable from the problems table, but
+# answer+subject stay denormalized as in ROLLOUTS_SCHEMA).
 POOL_SCHEMA = pa.schema(
     list(ROLLOUTS_SCHEMA) + [
-        pa.field("is_correct", pa.bool_()),
-        pa.field("scorer_id", pa.string()),   # which scorer produced is_correct
+        # criterion-free answer/match facts (math_verify + analysis.positional)
+        pa.field("answer_matches", pa.bool_()),   # permissive full-completion math_verify (== legacy is_correct)
+        pa.field("has_boxed", pa.bool_()),         # a closing \boxed{...} is present
+        pa.field("answer_char_pos", _I32),         # char offset of the verified answer, nullable
+        pa.field("answer_token_frac", pa.float32()),  # that position as a token fraction, nullable
+        # 0 = first occurrence of a completion for a problem; 1,2,... = natural repeats
+        pa.field("dup_index", _I32),
     ]
 )
 
@@ -88,8 +104,10 @@ SCORES_SCHEMA = pa.schema([
     ("run_id", _I32),
     ("branch_path", pa.list_(_I16)),
     ("sample_idx", _I16),
-    ("scorer_id", pa.string()),                # versioned scorer identity
-    ("is_correct", pa.bool_()),
+    ("scorer_id", pa.string()),                # versioned scorer identity (incl. params)
+    ("verdict", pa.string()),                  # correct | incorrect | unresolved
+    ("answer_matches", pa.bool_()),            # criterion-free permissive match (raw fact)
+    ("has_boxed", pa.bool_()),                 # raw fact: closing \boxed{...} present
     ("answer_char_pos", _I32),                 # nullable
     ("answer_token_frac", pa.float32()),       # nullable
     ("leak_class", pa.string()),               # keeper | leak | unlocated | incorrect

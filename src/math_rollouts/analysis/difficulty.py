@@ -1,14 +1,15 @@
 """Per-problem difficulty banding by base-model solve rate.
 
-A problem's difficulty is the base model's empirical solve rate (mean ``is_correct``
-over its naturally-sampled rollouts), bucketed into bands. Ported from the source
-``difficulty.py`` but DE-HARDCODED: instead of literal absolute paths, the
-generation parquets are resolved through the dataset's ``generations/<slug>/...``
-convention (local snapshot via ``$MATH_ROLLOUTS_DATA`` or the HF hub).
+A problem's difficulty is the base model's empirical solve rate (mean
+``answer_matches`` — the default ``answer-match`` verdict — over its naturally-sampled
+rollouts), bucketed into bands. Ported from the source ``difficulty.py`` but
+DE-HARDCODED: instead of literal absolute paths, the generation parquets are resolved
+through the dataset's ``generations/<slug>/...`` convention (local snapshot via
+``$MATH_ROLLOUTS_DATA`` or the HF hub).
 
-Banding reads the NATURALLY-SAMPLED pools (which carry ``is_correct`` + ``unique_id``)
-— e.g. ``math12k_L4_5_K64`` and ``math500_passK`` — not the opener experiments. A
-problem present in more than one file is averaged.
+Banding reads the NATURALLY-SAMPLED pools (which carry ``answer_matches`` +
+``unique_id``) — e.g. ``math12k_L4_5_K64`` and ``math500_passK`` — not the opener
+experiments. A problem present in more than one file is averaged.
 
     from math_rollouts.analysis.difficulty import band_for, band_table, BAND_ORDER
     band_for("Qwen/Qwen2.5-Math-1.5B", "math500/geometry/9467")   # -> "Medium"
@@ -22,9 +23,8 @@ from ..data.hf import _resolve, model_slug
 BAND_ORDER = ["Easy", "Medium", "Hard", "Very Hard", "Impossible"]
 
 # model_id -> experiment subdirs whose rollouts define difficulty. Each resolves to
-# generations/<slug>/<exp>/rollouts-or-legacy.parquet. The migrated natural-gen
-# cohorts keep the legacy schema (is_correct present), so a plain parquet name is
-# used here. Add models by adding a line — no other code changes.
+# generations/<slug>/<exp>.parquet — the flat natural pools (POOL_SCHEMA, carrying
+# answer_matches). Add models by adding a line — no other code changes.
 MODEL_DATA = {
     "Qwen/Qwen2.5-Math-1.5B": ["math12k_L4_5_K64", "math500_passK"],
     "sail/Qwen2.5-Math-1.5B-Oat-Zero": ["math12k_K64", "math500_passK"],
@@ -59,11 +59,11 @@ def band_table(model: str, data_root: str | None = None):
 
     if model not in MODEL_DATA:
         raise KeyError(f"no difficulty data registered for {model!r}; known: {sorted(MODEL_DATA)}")
-    frames = [pd.read_parquet(path, columns=["unique_id", "is_correct"])
+    frames = [pd.read_parquet(path, columns=["unique_id", "answer_matches"])
               for path in _gen_paths(model, data_root)]
     allrows = pd.concat(frames, ignore_index=True)
 
-    out = allrows.groupby("unique_id").is_correct.agg(["mean", "size"]).reset_index()
+    out = allrows.groupby("unique_id").answer_matches.agg(["mean", "size"]).reset_index()
     out.columns = ["unique_id", "acc", "n"]
     out["band"] = out["acc"].apply(assign_band)
     return out

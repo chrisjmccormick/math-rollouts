@@ -6,7 +6,7 @@ GPU and writes per-problem shards (one row per rollout, with a per-token
 DataFrame of those shard rows, so reports can reshape the pool (e.g. an even-K
 subsample) and recompute size statistics without re-running the GPU job.
 
-A shard-row DataFrame has at least: ``unique_id``, ``is_correct``, ``nuc_sizes``
+A shard-row DataFrame has at least: ``unique_id``, ``answer_matches``, ``nuc_sizes``
 (per-token list, sizes in ``1..top_k``) and ``chosen_is_top1`` (per-token bool
 list). ``load_token_nuclei_pool`` in ``data.hf`` returns exactly this.
 """
@@ -116,7 +116,7 @@ def summarize_nuclei(df, *, top_k: int = DEFAULT_TOP_K, band_map: dict | None = 
         first[a[0]] += 1
         n_top1 += t1
         n_rollouts += 1
-        if row.is_correct:
+        if row.answer_matches:
             corr += bc
             n_top1_corr += t1
         else:

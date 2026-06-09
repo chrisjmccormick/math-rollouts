@@ -66,7 +66,7 @@ def load_token_nuclei_pool(model_id: str, pool: str, *, columns: list[str] | Non
     hub via ``snapshot_download``.
 
     ``columns`` is forwarded to ``read_parquet`` — pass the light columns (e.g.
-    ``["unique_id", "is_correct", "nuc_sizes", "chosen_is_top1"]``) to skip the bulky
+    ``["unique_id", "answer_matches", "nuc_sizes", "chosen_is_top1"]``) to skip the bulky
     ``kept_ids``/``kept_logits`` lists when you only need size statistics."""
     import pandas as pd
 

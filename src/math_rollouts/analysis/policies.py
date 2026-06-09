@@ -10,8 +10,9 @@ base model's accuracy under four first-fork opening policies:
   oracle        always pick the best opener
 
 Openers are identified by ``branch_path`` (the canonical, depth-safe key), so this
-works unchanged for depth-N trees. Accuracy per opener = mean ``is_correct`` over
-its rollout group; the denominator is the group's row count.
+works unchanged for depth-N trees. Accuracy per opener = mean ``answer_matches`` (the
+default ``answer-match`` verdict) over its rollout group; the denominator is the
+group's row count.
 """
 from __future__ import annotations
 
@@ -23,10 +24,10 @@ def _bp_key(x):
 
 
 def per_opener_accuracy(scored_rollouts):
-    """Series indexed by (unique_id, branch_path-tuple) -> mean is_correct."""
+    """Series indexed by (unique_id, branch_path-tuple) -> mean answer_matches."""
     df = scored_rollouts.copy()
     df["_bp"] = df.branch_path.map(_bp_key)
-    return df.groupby(["unique_id", "_bp"]).is_correct.mean()
+    return df.groupby(["unique_id", "_bp"]).answer_matches.mean()
 
 
 def missing_openers(nuclei, acc):
@@ -97,7 +98,7 @@ def join_scores(rollouts, scores):
 
     ``branch_path`` is compared by value (as a tuple), since list columns are not
     directly joinable. Returns the rollouts frame with the score columns
-    (``is_correct`` etc.) attached — the input that ``policy_table`` expects."""
+    (``answer_matches`` etc.) attached — the input that ``policy_table`` expects."""
     from ..schema import ROLLOUT_KEY
     r, s = rollouts.copy(), scores.copy()
     for df in (r, s):

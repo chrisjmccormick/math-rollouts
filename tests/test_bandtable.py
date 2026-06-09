@@ -12,8 +12,8 @@ from math_rollouts.analysis.bandtable import (
 
 
 def _rollouts(rows):
-    """rows: list of (unique_id, subject, is_correct)."""
-    return pd.DataFrame(rows, columns=["unique_id", "subject", "is_correct"])
+    """rows: list of (unique_id, subject, answer_matches)."""
+    return pd.DataFrame(rows, columns=["unique_id", "subject", "answer_matches"])
 
 
 # Two problems: p1 Algebra (Easy), p2 Geometry (Hard).
@@ -76,7 +76,7 @@ def _mixed_batches():
     expansion (run_id=1) at a much lower success rate."""
     rows = [("p1", "Algebra", True, 0), ("p1", "Algebra", True, 0)]
     rows += [("p1", "Algebra", False, 1)] * 4
-    return pd.DataFrame(rows, columns=["unique_id", "subject", "is_correct", "run_id"])
+    return pd.DataFrame(rows, columns=["unique_id", "subject", "answer_matches", "run_id"])
 
 
 def test_per_problem_refuses_to_pool_mixed_run_ids():
