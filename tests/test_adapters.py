@@ -62,6 +62,42 @@ def test_thinking_scoring_post_think_only():
     assert check_correct_post_think("no close token \\boxed{42}", "42") is False
 
 
+def test_row_attributes_think_aware():
+    # row_attributes routes answer/match facts to the post-</think> region for
+    # thinking models (so answer_matches == the default post-think-v1 verdict that
+    # the analysis stack reads), and to the full text otherwise.
+    from math_rollouts.data.pools import _is_thinking, row_attributes
+    base = dict(answer="42", completion_token_ids=[1, 2, 3])
+
+    # non-thinking: full completion is scored.
+    a = row_attributes({**base, "completion_text": "x \\boxed{42}"}, is_thinking=False)
+    assert a["answer_matches"] is True and a["has_boxed"] is True
+
+    # thinking, answer committed after </think> -> matches.
+    good = row_attributes({**base, "completion_text": "think... </think> \\boxed{42}"},
+                          is_thinking=True)
+    assert good["answer_matches"] is True and good["answer_char_pos"] is not None
+
+    # thinking, box ONLY inside the reasoning -> NOT counted (the key fix).
+    leaked = row_attributes({**base, "completion_text": "\\boxed{42} </think> unsure"},
+                            is_thinking=True)
+    assert leaked["answer_matches"] is False and leaked["has_boxed"] is False
+
+    # thinking, never closed </think> (truncated mid-thought) -> no committed answer.
+    trunc = row_attributes({**base, "completion_text": "still thinking \\boxed{42}"},
+                           is_thinking=True)
+    assert trunc["answer_matches"] is False and trunc["answer_char_pos"] is None
+
+    # the same text scored as non-thinking WOULD match -> confirms region routing.
+    assert row_attributes({**base, "completion_text": "\\boxed{42} </think> unsure"},
+                          is_thinking=False)["answer_matches"] is True
+
+    # callers resolve is_thinking from the model_id's adapter.
+    assert _is_thinking("Qwen/Qwen3-8B") is True
+    assert _is_thinking("Qwen/Qwen2.5-Math-1.5B") is False
+    assert _is_thinking(None) is False
+
+
 def test_answer_match_is_truncation_tolerant():
     # DEFAULT scorer: correct iff answer_matches, regardless of how it terminated.
     scorer = get_scorer("answer-match")

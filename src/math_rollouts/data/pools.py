@@ -42,22 +42,47 @@ def _eos_excluded_count(token_ids, eos_id) -> int:
     return n
 
 
-def row_attributes(row: dict, *, tok=None, prompt_len=None, eos_id=None) -> dict:
+def _is_thinking(model_id) -> bool:
+    """Whether ``model_id``'s adapter is a thinking model (False if unset)."""
+    if not model_id:
+        return False
+    from ..adapters import get_adapter
+    return bool(get_adapter(model_id).is_thinking)
+
+
+def row_attributes(row: dict, *, tok=None, prompt_len=None, eos_id=None,
+                   is_thinking: bool = False) -> dict:
     """Criterion-free raw attributes for ONE rollout row. Pure (no shared state), so
     it is reused both serially and by the parallel migration workers.
 
     Prefers facts already present on the row (e.g. ``terminal``/lengths stamped at
-    generation) and computes the rest: ``answer_matches`` (permissive full-text
-    math_verify), ``has_boxed``, the verified-answer char position + token fraction,
-    the termination enum, and the EOS-excluded lengths. ``prompt_len`` is this
-    problem's ``prompt_num_tokens`` (needed for total + token-fraction denominator)."""
+    generation) and computes the rest: ``answer_matches``, ``has_boxed``, the
+    verified-answer char position + token fraction, the termination enum, and the
+    EOS-excluded lengths. ``prompt_len`` is this problem's ``prompt_num_tokens``.
+
+    For ``is_thinking`` models the *committed* answer is the post-``</think>`` region,
+    so ``answer_matches``/``has_boxed``/placement are computed THERE (making
+    ``answer_matches`` == the model's default ``post-think-v1`` verdict, which the
+    analysis stack reads directly). A thinking completion that never closed ``</think>``
+    (e.g. truncated mid-thought) has no committed answer → ``answer_matches`` False.
+    Non-thinking models score the whole completion (region == full text)."""
     from ..analysis.positional import has_boxed, verified_answer_char_pos
-    from ..score.scorers import answer_matches as _answer_matches, derive_terminal
+    from ..score.scorers import (THINK_CLOSE_STR, answer_matches as _answer_matches,
+                                 derive_terminal)
 
     text, answer = row["completion_text"], row["answer"]
-    am = bool(_answer_matches(text, answer))
-    hb = bool(has_boxed(text))
-    pos = verified_answer_char_pos(text, answer)
+    # Scoring region: post-</think> for thinking models (empty if it never closed),
+    # else the whole completion. ``pos`` is reported as a FULL-text char offset.
+    region_start = 0
+    if is_thinking:
+        i = text.find(THINK_CLOSE_STR)
+        region_start = i + len(THINK_CLOSE_STR) if i != -1 else len(text)
+    region = text[region_start:]
+
+    am = bool(_answer_matches(region, answer))
+    hb = bool(has_boxed(region))
+    rpos = verified_answer_char_pos(region, answer)
+    pos = region_start + rpos if rpos is not None else None
     cti = row.get("completion_token_ids")
     ids = list(cti) if cti is not None else []
 
@@ -96,12 +121,14 @@ def row_attributes(row: dict, *, tok=None, prompt_len=None, eos_id=None) -> dict
 
 
 def compute_raw_attributes(rows: list[dict], *, tok=None,
-                           prompt_len: dict | None = None, eos_id=None) -> list[dict]:
+                           prompt_len: dict | None = None, eos_id=None,
+                           is_thinking: bool = False) -> list[dict]:
     """Annotate raw rollout rows with the criterion-free pool attributes (serial).
-    ``prompt_len`` maps ``unique_id -> prompt_num_tokens``."""
+    ``prompt_len`` maps ``unique_id -> prompt_num_tokens``. ``is_thinking`` routes the
+    answer/match facts to the post-``</think>`` region (see ``row_attributes``)."""
     pl = prompt_len or {}
     return [{**r, **row_attributes(r, tok=tok, prompt_len=pl.get(r.get("unique_id")),
-                                   eos_id=eos_id)} for r in rows]
+                                   eos_id=eos_id, is_thinking=is_thinking)} for r in rows]
 
 
 def add_dup_index(df):
@@ -135,7 +162,8 @@ def to_pool_frame(rows: list[dict]):
 def build_pool(rows: list[dict], *, model_id: str | None = None, tok=None,
                prompt_len: dict | None = None, eos_id=None):
     """Annotate raw rollout rows + conform to ``POOL_SCHEMA`` in one step."""
-    annotated = compute_raw_attributes(rows, tok=tok, prompt_len=prompt_len, eos_id=eos_id)
+    annotated = compute_raw_attributes(rows, tok=tok, prompt_len=prompt_len, eos_id=eos_id,
+                                       is_thinking=_is_thinking(model_id))
     return to_pool_frame(annotated)
 
 
@@ -216,7 +244,8 @@ def migrate_legacy_pool(legacy_df, *, model_id: str | None = None, tok=None,
         # explicit None-checks: empty numpy arrays are ambiguous under `or`.
         r["branch_path"] = list(bp) if bp is not None else []
         r["opener_token_ids"] = list(op) if op is not None else []
-    annotated = compute_raw_attributes(rows, tok=tok, prompt_len=prompt_len, eos_id=eos_id)
+    annotated = compute_raw_attributes(rows, tok=tok, prompt_len=prompt_len, eos_id=eos_id,
+                                       is_thinking=_is_thinking(model_id))
     df = table_from_rows(annotated, POOL_SCHEMA).to_pandas()
     if "dup_index" in legacy_df.columns:
         df["dup_index"] = legacy_df["dup_index"].astype("int32").to_numpy()
