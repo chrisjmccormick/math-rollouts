@@ -6,7 +6,7 @@ from __future__ import annotations
 import io
 import sys
 
-from math_rollouts.generate.natural import _filenoable_stdio
+from math_rollouts.config import filenoable_stdio as _filenoable_stdio
 
 
 class _KernelStream(io.StringIO):

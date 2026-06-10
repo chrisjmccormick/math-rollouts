@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, asdict
 
 # Must be set before `import vllm` anywhere downstream. setdefault so an explicit
@@ -18,10 +19,40 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 
 # Under a Jupyter/Colab kernel, run the V1 engine IN-PROCESS: the engine-core
 # subprocess dies opaquely there ("Failed core proc(s): {}" with the root cause
-# swallowed), and the in-process path lets generate.natural's stdio guard handle
+# swallowed), and the in-process path lets ``filenoable_stdio`` (below) handle
 # ipykernel's fileno-less streams (vLLM init calls sys.stdout.fileno()).
 if "ipykernel" in sys.modules:
     os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
+
+@contextmanager
+def filenoable_stdio():
+    """vLLM engine init calls ``sys.stdout.fileno()`` (its ``suppress_stdout`` around
+    the gloo group setup), which ipykernel's stream wrappers raise on — the classic
+    Colab/Jupyter ``UnsupportedOperation: fileno`` crash. Swap any fileno-less
+    stream for devnull JUST for the wrapped block; vLLM's loggers hold the original
+    notebook streams, so init logging still displays."""
+    def _broken(stream):
+        try:
+            stream.fileno()
+            return False
+        except Exception:
+            return True
+
+    swap_out, swap_err = _broken(sys.stdout), _broken(sys.stderr)
+    if not (swap_out or swap_err):
+        yield
+        return
+    old_out, old_err = sys.stdout, sys.stderr
+    with open(os.devnull, "w") as devnull:
+        if swap_out:
+            sys.stdout = devnull
+        if swap_err:
+            sys.stderr = devnull
+        try:
+            yield
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
 
 
 @dataclass(frozen=True)
