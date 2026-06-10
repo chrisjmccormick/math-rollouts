@@ -1,0 +1,23 @@
+# Colab generation stack for the math-rollouts notebooks — PINNED.
+#
+# Colab's runtime ships CUDA 12; current vLLM releases default to CUDA-13 wheels
+# and fail at import with `libcudart.so.13: cannot open shared object file`.
+# vLLM 0.12.0 is the newest CUDA-12-compatible line and itself pins torch==2.9.0;
+# transformers<5 / huggingface_hub<1.0 follow from vLLM. Trimmed from the proven
+# trl-era pin set (Colab A100, Python 3.12, 2026-06-10) — the training stack
+# (trl/accelerate/wandb) is dropped, vllm pinned directly instead of via
+# trl[vllm]. The notebook install cell inlines these pins — keep them in sync.
+#
+# Install order on Colab: this file FIRST, then the package WITHOUT the [gen]
+# extra (so pip doesn't re-resolve vllm/torch):
+#     pip install -r requirements/colab-gen.txt
+#     pip install "math_rollouts @ git+https://github.com/chrisjmccormick/math-rollouts.git"
+# On a bare Linux GPU box use `pip install 'math_rollouts[gen]'` instead.
+vllm==0.12.0
+torch==2.9.0
+triton==3.5.0
+transformers==4.57.6
+tokenizers==0.22.2
+huggingface_hub==0.36.2
+datasets==4.5.0
+pyarrow==23.0.1

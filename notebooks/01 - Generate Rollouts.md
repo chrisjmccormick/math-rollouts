@@ -78,18 +78,34 @@ print("HF user:", HF_USERNAME, "| HF token:", "set" if HF_TOKEN else "MISSING")
 ```
 
 <!-- md -->
-# Install the `math-rollouts` package (with the `[gen]` extra)
+# Install the `math-rollouts` package + the generation stack
 
-Generation needs vLLM, so unlike the compute/analysis notebooks we install the
-**`[gen]`** extra (torch / transformers / vllm). On a fresh Colab GPU runtime the
-vLLM install takes a few minutes.
+Generation needs vLLM, and **where it comes from depends on the box**:
+
+- **Colab**: the runtime ships CUDA 12, but current vLLM releases default to
+  CUDA-13 wheels and die at import with `libcudart.so.13: cannot open shared
+  object file`. So we install a **pinned, Colab-proven stack first** (vLLM
+  0.12.0 — the newest CUDA-12 line — which itself pins torch 2.9.0; mirrors
+  `requirements/colab-gen.txt`), then the package *without* the `[gen]` extra
+  so pip doesn't re-resolve vllm/torch. Ignore pip's "dependency conflicts"
+  warnings about Colab-preinstalled packages (google-adk / gradio / cudf etc.)
+  — they're unrelated.
+- **Bare Linux GPU box**: the unpinned **`[gen]`** extra is fine.
+
+Either way the vLLM install takes a few minutes on a fresh runtime.
 
 <!-- code -->
 ```python
 GH_OWNER = "chrisjmccormick"   # GitHub owner of the math-rollouts CODE repo
 _auth = f"{GH_TOKEN}@" if GH_TOKEN else ""
-pip_url = f"math_rollouts[gen] @ git+https://{_auth}github.com/{GH_OWNER}/math-rollouts.git"
-!pip install -q "{pip_url}"
+REPO = f"git+https://{_auth}github.com/{GH_OWNER}/math-rollouts.git"
+
+if is_colab:
+    # keep in sync with requirements/colab-gen.txt
+    !pip install -q vllm==0.12.0 torch==2.9.0 triton==3.5.0 transformers==4.57.6 tokenizers==0.22.2 huggingface_hub==0.36.2 datasets==4.5.0 pyarrow==23.0.1
+    !pip install -q "math_rollouts @ {REPO}"
+else:
+    !pip install -q "math_rollouts[gen] @ {REPO}"
 ```
 
 <!-- md -->

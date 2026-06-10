@@ -20,7 +20,9 @@ dependencies = [
 
 [project.optional-dependencies]
 # GPU generation deps; kept optional so CPU-only consumers (scoring, analysis,
-# data loading) can install without vLLM/torch.
+# data loading) can install without vLLM/torch. Deliberately UNPINNED for bare
+# Linux boxes; on Colab (CUDA 12 — current vLLM wheels need CUDA 13) install
+# requirements/colab-gen.txt first and skip this extra.
 gen = [
     "torch",
     "transformers",
