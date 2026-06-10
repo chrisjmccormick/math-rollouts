@@ -6,6 +6,7 @@ from __future__ import annotations
 import pytest
 
 from math_rollouts.adapters import (
+    DeepseekR1DistillAdapter,
     PaperBaseAdapter,
     Qwen3ThinkAdapter,
     QwenMathAdapter,
@@ -21,18 +22,55 @@ def test_registry_resolution():
     assert isinstance(get_adapter("sail/Qwen2.5-Math-1.5B-Oat-Zero"), QwenMathAdapter)
     assert isinstance(get_adapter("Qwen/Qwen3-8B"), Qwen3ThinkAdapter)
     assert isinstance(get_adapter("Qwen/Qwen3-8B-Base"), PaperBaseAdapter)
+    assert isinstance(get_adapter("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"),
+                      DeepseekR1DistillAdapter)
 
 
 def test_is_thinking_flags():
     assert get_adapter("Qwen/Qwen2.5-Math-1.5B").is_thinking is False
     assert get_adapter("Qwen/Qwen3-8B").is_thinking is True
     assert get_adapter("Qwen/Qwen3-8B-Base").is_thinking is False
+    assert get_adapter("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B").is_thinking is True
 
 
 def test_registry_family_override_and_unknown():
     assert isinstance(get_adapter("some/unknown", family="qwen3_think"), Qwen3ThinkAdapter)
+    assert isinstance(get_adapter("deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+                                  family="deepseek_distill"), DeepseekR1DistillAdapter)
     with pytest.raises(KeyError):
         get_adapter("totally/unregistered")
+
+
+def test_deepseek_think_ids_differ_from_qwen3():
+    # The R1-distill reasoning tokens are 151648/151649, NOT Qwen3's 151667/151668.
+    # The </think> STRING is shared, so post-think scoring is unchanged; the ids are
+    # load-bearing for terminal_ids / prompt construction.
+    from math_rollouts.adapters import deepseek_distill, qwen3_think
+    assert (deepseek_distill.THINK_OPEN, deepseek_distill.THINK_CLOSE) == (151648, 151649)
+    assert (qwen3_think.THINK_OPEN, qwen3_think.THINK_CLOSE) == (151667, 151668)
+
+
+def test_deepseek_prompt_forces_think_open_once():
+    # prompt_ids must end with <think>\n exactly once, whether or not the chat
+    # template already appended it (it changed across HF revisions).
+    class FakeTok:
+        def __init__(self, template_appends_think):
+            self.appends = template_appends_think
+
+        def __call__(self, text, add_special_tokens=False):
+            assert text == "<think>\n"
+            class R:  # mimic BatchEncoding.input_ids
+                input_ids = [151648, 198]
+            return R()
+
+        def apply_chat_template(self, messages, **kw):
+            base = [151646, 1, 2, 3]      # bos + user turn + assistant tag (stand-in)
+            return base + ([151648, 198] if self.appends else [])
+
+    prob = {"problem": "What is 2+2?"}
+    old = DeepseekR1DistillAdapter().prompt_ids(prob, FakeTok(False))
+    new = DeepseekR1DistillAdapter().prompt_ids(prob, FakeTok(True))
+    assert old == new == [151646, 1, 2, 3, 151648, 198]
 
 
 def test_qwen_math_template_shape():

@@ -8,22 +8,31 @@ from __future__ import annotations
 
 This notebook produces the **naturally-sampled rollout pools** the rest of the
 pipeline builds on: for each MATH problem it samples K completions straight from the
-prompt (the model picks its own first token — no forced opener), scores them, and
-writes a single self-contained `generations/<model-slug>/<pool>.parquet` to the
+prompt (the model picks its own first token — no forced opener), computes the raw
+answer/match facts, and writes a single self-contained
+`generations/<model-slug>/<pool>.parquet` to the
 [`ChrisMcCormick/math-rollouts`](https://huggingface.co/datasets/ChrisMcCormick/math-rollouts)
 dataset.
 
-A **pool** is just *scored natural rollouts in the canonical schema*
-(`schema.POOL_SCHEMA` = `ROLLOUTS_SCHEMA` + `is_correct` + `scorer_id`), with
-per-batch provenance in a `<pool>.meta.json` sidecar.
+A **pool** is just *natural rollouts in the canonical schema*
+(`schema.POOL_SCHEMA` = `ROLLOUTS_SCHEMA` + the criterion-free answer/match facts +
+`dup_index`), with per-batch provenance in a `<pool>.meta.json` sidecar. The pool
+bakes **no verdict**: it stores the *facts* about each rollout (`answer_matches`,
+`has_boxed`, answer placement, termination, lengths) and accuracy is reproduced by a
+**named scorer** over those facts. The default reporting scorer is `answer-match`
+(`correct ⟺ answer_matches`); for **thinking models** it is `post-think-v1` — and
+`answer_matches` already equals that verdict, because the facts are computed on the
+post-`</think>` region for thinking adapters.
 
-Two examples:
-1. **Generate K=64 rollouts for MATH-500.**
+Three examples:
+1. **Generate K=64 rollouts for MATH-500** (non-thinking Qwen2.5-Math).
 2. **Extend an existing pool** — top every problem up to at least K=64 (our case:
    the Oat-Zero `math500_passK` pool, where many problems only have 16).
+3. **Thinking model: Qwen3-8B on MATH-500** — top up (or bootstrap) the
+   `math500_natural` pool with a reasoning-sized token budget.
 
 The heavy lifting lives in the package — `generate.natural.generate_natural` (vLLM)
-and the `data.pools` helpers (score / assemble / deficit / extend); this notebook
+and the `data.pools` helpers (facts / assemble / deficit / extend); this notebook
 just wires up secrets, installs the code on a GPU, and uploads.
 
 <!-- md -->
@@ -92,8 +101,8 @@ pip_url = f"math_rollouts[gen] @ git+https://{_auth}github.com/{GH_OWNER}/math-r
 <!-- md -->
 ## Configure
 
-- `MODEL_ID` — any registered model (non-thinking here; thinking models work too,
-  with a larger `max_tokens` and the `post-think-v1` scorer).
+- `MODEL_ID` — any registered model (non-thinking here; for a thinking model see
+  Example 3 — it needs a much larger `max_tokens`).
 - `POOL` — output pool name → `generations/<slug>/<POOL>.parquet`.
 - `K` — rollouts per problem.
 - `SEED` — vLLM sampling seed (batch identity; stored on the rows).
@@ -108,33 +117,41 @@ OUT_ROOT = "/content/math-rollouts-data"
 ```
 
 <!-- md -->
-## Generate, score, assemble
+## Generate + assemble the pool
 
 `generate_natural` loads the problems' prompts via the model's adapter, samples K
 completions each on the GPU, and returns raw rollout rows. `pools.build_pool` then
-scores them (the model's canonical scorer — `boxed-match-stop-v1` here) and conforms
-them to `POOL_SCHEMA`.
+computes the criterion-free facts (`answer_matches`, `has_boxed`, answer placement,
+termination, lengths) and conforms the rows to `POOL_SCHEMA`. The tokenizer is
+passed through so `answer_token_frac` can be computed.
+
+The headline accuracy is just the default `answer-match` scorer — i.e. the mean of
+the `answer_matches` column.
 
 <!-- code -->
 ```python
+from transformers import AutoTokenizer
+
 from math_rollouts.data.problems import load_problems_by_split
 from math_rollouts.generate.natural import generate_natural
 from math_rollouts.data import pools
 
 problems = load_problems_by_split("math500")
-rows = generate_natural(MODEL_ID, problems, k=K, run_id=0, seed=SEED)
+tok = AutoTokenizer.from_pretrained(MODEL_ID)
+rows = generate_natural(MODEL_ID, problems, k=K, run_id=0, seed=SEED, tok=tok)
 
-pool_df, scorer_id = pools.build_pool(rows, model_id=MODEL_ID)
-acc = pool_df.is_correct.mean()
+pool_df = pools.build_pool(rows, model_id=MODEL_ID, tok=tok)
+acc = pool_df.answer_matches.mean()
 print(f"{len(pool_df):,} rollouts over {pool_df.unique_id.nunique()} problems "
-      f"| scorer {scorer_id} | accuracy {acc*100:.1f}%")
+      f"| accuracy (answer-match) {acc*100:.1f}%")
 ```
 
 <!-- md -->
 ## Write + upload
 
 Writes `<POOL>.parquet` (canonical schema) plus a `<POOL>.meta.json` provenance
-sidecar, then uploads both to `generations/<slug>/` in the dataset.
+sidecar, then uploads both to `generations/<slug>/` in the dataset. The meta records
+which named scorer reproduces the headline number (`default_reporting_scorer`).
 
 <!-- code -->
 ```python
@@ -147,7 +164,8 @@ slug = model_slug(MODEL_ID)
 out = Path(OUT_ROOT) / "generations" / slug / f"{POOL}.parquet"
 pools.write_pool(pool_df, out)
 pools.write_pool_meta(
-    out.with_suffix(".meta.json"), model_id=MODEL_ID, pool=POOL, scorer_id=scorer_id,
+    out.with_suffix(".meta.json"), model_id=MODEL_ID, pool=POOL,
+    default_reporting_scorer=pools.default_scorer_id(MODEL_ID),
     gen_config=GenConfig().as_dict(),
     runs=[{"run_id": 0, "cohort": POOL, "k": K, "seed": SEED, "n_rollouts": len(pool_df)}],
     df=pool_df,
@@ -175,8 +193,9 @@ K=64 (so an even-K analysis can keep all 500), we generate only the per-problem
 
 `pool_deficit` computes `{unique_id: target_k - have}` for the short problems;
 `generate_natural` accepts that dict directly (per-problem sample counts via vLLM's
-per-prompt sampling params). `ensure_pool_schema` migrates the pool to the canonical
-schema first if it hasn't been already.
+per-prompt sampling params). `ensure_pool_schema` is a no-op on an
+already-migrated pool and migrates a legacy one (deriving the answer/match facts)
+otherwise — so the extend path works either way.
 
 <!-- code -->
 ```python
@@ -191,15 +210,19 @@ SEED2     = 64
 from math_rollouts.data.hf import load_generation_parquet
 from math_rollouts.data.problems import load_problems_by_ids
 
-existing = pools.ensure_pool_schema(load_generation_parquet(OAT_MODEL, OAT_POOL), OAT_MODEL)
+oat_tok = AutoTokenizer.from_pretrained(OAT_MODEL)
+existing = pools.ensure_pool_schema(
+    load_generation_parquet(OAT_MODEL, OAT_POOL), OAT_MODEL,
+    tok=oat_tok, eos_id=oat_tok.eos_token_id)
 deficit = pools.pool_deficit(existing, TARGET_K)
 print(f"{len(deficit)}/{existing.unique_id.nunique()} problems below K={TARGET_K}; "
       f"generating {sum(deficit.values()):,} new rollouts")
 
 probs = load_problems_by_ids(list(deficit))
 run_id = pools.next_run_id(existing)              # fresh batch id (no sample_idx collisions)
-new_rows = generate_natural(OAT_MODEL, probs, k=deficit, run_id=run_id, seed=SEED2)
-new_df, scorer_id = pools.build_pool(new_rows, model_id=OAT_MODEL)
+new_rows = generate_natural(OAT_MODEL, probs, k=deficit, run_id=run_id, seed=SEED2,
+                            tok=oat_tok)
+new_df = pools.build_pool(new_rows, model_id=OAT_MODEL, tok=oat_tok)
 
 combined = pools.extend_pool(existing, new_df)
 print(f"pool: {len(existing):,} -> {len(combined):,} rollouts")
@@ -215,7 +238,8 @@ slug = model_slug(OAT_MODEL)
 out = Path(OUT_ROOT) / "generations" / slug / f"{OAT_POOL}.parquet"
 pools.write_pool(combined, out)
 pools.write_pool_meta(
-    out.with_suffix(".meta.json"), model_id=OAT_MODEL, pool=OAT_POOL, scorer_id=scorer_id,
+    out.with_suffix(".meta.json"), model_id=OAT_MODEL, pool=OAT_POOL,
+    default_reporting_scorer=pools.default_scorer_id(OAT_MODEL),
     gen_config=GenConfig().as_dict(),
     runs=[{"run_id": int(r), "n_rollouts": int((combined.run_id == r).sum())}
           for r in sorted(combined.run_id.unique())],
@@ -238,17 +262,155 @@ per-token nucleus store, then **`03 - Analyze Rollout Nuclei`** to re-read the s
 # ▂▂▂▂▂▂▂▂▂▂▂▂
 
 <!-- md -->
-## Notes — thinking models & truncation (forward-looking)
+# Example 3 — Thinking model: Qwen3-8B on MATH-500
 
-- **Thinking models** (e.g. Qwen3) use the *same* `POOL_SCHEMA`. "Did `</think>`
-  close?" and post-`</think>` correctness are handled by the **scorer**
-  (`post-think-v1`, selected automatically for thinking adapters) — not by extra
-  schema columns. Give them a much larger `max_tokens`.
-- **Truncation / budget.** `finish_reason` (`stop` = self-stopped vs `length` =
-  hit the budget) and the per-row `max_gen_len` record how each rollout ended.
-  Because they're per-row, a pool can mix budgets — which sets up a future
-  **length-extend**: re-generate the `finish_reason == "length"` rows at a higher
-  cap and update them in place by `ROLLOUT_KEY` (`model_id, unique_id, run_id,
-  branch_path, sample_idx`), bumping `max_gen_len`/`finish_reason`. (This notebook
-  implements the *width*-extend — more rollouts per problem — above.)
+Qwen3-8B is a **thinking model**: the adapter forces `<think>\n` after the chat
+template (so sampling starts at the first *reasoning* token) and the committed
+answer is whatever follows `</think>`. Two practical differences from Examples 1–2:
+
+- **Token budget.** Reasoning traces are long — we generate with
+  `max_tokens=16384` (vs the 3,000 default). Rollouts that still hit the cap land
+  as `terminal == "truncated"` with no committed answer, which is informative, not
+  an error; their per-row `max_gen_len` records the budget they had.
+- **Scoring.** Nothing extra to do: for thinking adapters the pool's
+  `answer_matches` fact is computed on the **post-`</think>` region** (a truncated
+  or think-only-boxed rollout is False), so the mean of `answer_matches` *is* the
+  `post-think-v1` verdict, and that is what goes in the meta as the
+  `default_reporting_scorer`.
+
+This cell is **self-contained** (run Secrets + Install above first): it tops up the
+existing `qwen3-8b/math500_natural` pool — migrated from the guided-rollouts
+project — to `TARGET_K3` per problem, or bootstraps the pool from scratch if it
+isn't on the hub yet.
+
+**Hardware:** Qwen3-8B in bf16 is ~16 GB of weights plus KV cache at an 18k
+context — use an A100/H100-class GPU (a T4 won't fit).
+
+<!-- code -->
+```python
+from math_rollouts.config import GenConfig
+
+QWEN3_MODEL = "Qwen/Qwen3-8B"
+QWEN3_POOL  = "math500_natural"   # pool name migrated from guided-rollouts
+TARGET_K3   = 64                  # top every problem up to at least this many
+SEED3       = 1
+OUT_ROOT    = "/content/math-rollouts-data"
+
+# Qwen3's recommended thinking-mode sampling (T=0.6, top_p=0.95) matches the
+# project defaults; only the budget changes. max_model_len covers prompt + budget.
+THINK_CFG = GenConfig(max_tokens=16384, max_model_len=18432)
 ```
+
+<!-- md -->
+## Load the existing pool (or start fresh) and size the deficit
+
+`pool_deficit(..., ids=math500_ids)` counts a problem that is *absent* from the
+pool as a full `TARGET_K3` deficit, so partial pools and a missing pool are both
+handled by the same path.
+
+<!-- code -->
+```python
+from transformers import AutoTokenizer
+from huggingface_hub.utils import EntryNotFoundError
+
+from math_rollouts.data import pools
+from math_rollouts.data.hf import load_generation_parquet
+from math_rollouts.data.problems import load_problems_by_ids, load_problems_by_split
+
+math500_ids = [p["unique_id"] for p in load_problems_by_split("math500")]
+tok3 = AutoTokenizer.from_pretrained(QWEN3_MODEL)
+
+try:
+    existing = pools.ensure_pool_schema(
+        load_generation_parquet(QWEN3_MODEL, QWEN3_POOL), QWEN3_MODEL,
+        tok=tok3, eos_id=tok3.eos_token_id)
+    print(f"existing pool: {len(existing):,} rollouts over "
+          f"{existing.unique_id.nunique()} problems")
+except EntryNotFoundError:
+    existing = None
+    print(f"no {QWEN3_POOL} on the hub yet - bootstrapping from scratch")
+
+deficit = (pools.pool_deficit(existing, TARGET_K3, ids=math500_ids)
+           if existing is not None else {uid: TARGET_K3 for uid in math500_ids})
+run_id = pools.next_run_id(existing)
+print(f"{len(deficit)} problems below K={TARGET_K3}; "
+      f"generating {sum(deficit.values()):,} rollouts (run_id={run_id})")
+```
+
+<!-- md -->
+## Generate, assemble, extend
+
+Same flow as Example 2; the only thinking-model knob is `cfg=THINK_CFG`. With
+~16k-token traces this is the long pole — budget several GPU-hours for a full
+bootstrap (a top-up of a few short problems is much faster).
+
+<!-- code -->
+```python
+from math_rollouts.generate.natural import generate_natural
+
+probs = load_problems_by_ids(list(deficit))
+new_rows = generate_natural(QWEN3_MODEL, probs, k=deficit, run_id=run_id,
+                            seed=SEED3, cfg=THINK_CFG, tok=tok3)
+new_df = pools.build_pool(new_rows, model_id=QWEN3_MODEL, tok=tok3)
+combined = pools.extend_pool(existing, new_df)   # handles existing=None too
+
+acc = combined.answer_matches.mean()             # == post-think-v1 verdict
+trunc = (combined.terminal == "truncated").mean()
+n_before = 0 if existing is None else len(existing)
+print(f"pool: {n_before:,} -> {len(combined):,} rollouts "
+      f"| post-think accuracy {acc*100:.1f}% | truncated {trunc*100:.1f}%")
+print("min rollouts/problem now:", combined.groupby("unique_id").size().min())
+```
+
+<!-- md -->
+## Write + upload
+
+The meta's `gen_config` records *this batch's* config; a pool may legitimately mix
+budgets across batches (the per-row `temperature`/`top_p`/`max_gen_len` are the
+authoritative record — that is what `benchmark@budget` keys off). The
+`default_reporting_scorer` resolves to `post-think-v1` for Qwen3.
+
+<!-- code -->
+```python
+from pathlib import Path
+from huggingface_hub import HfApi
+from math_rollouts.data.hf import model_slug
+
+slug = model_slug(QWEN3_MODEL)
+out = Path(OUT_ROOT) / "generations" / slug / f"{QWEN3_POOL}.parquet"
+pools.write_pool(combined, out)
+pools.write_pool_meta(
+    out.with_suffix(".meta.json"), model_id=QWEN3_MODEL, pool=QWEN3_POOL,
+    default_reporting_scorer=pools.default_scorer_id(QWEN3_MODEL),  # post-think-v1
+    gen_config=THINK_CFG.as_dict(),
+    runs=[{"run_id": int(r), "n_rollouts": int((combined.run_id == r).sum())}
+          for r in sorted(combined.run_id.unique())],
+    df=combined,
+)
+
+api = HfApi(token=HF_TOKEN)
+repo_id = f"{HF_USERNAME}/math-rollouts"
+for f in (out, out.with_suffix(".meta.json")):
+    api.upload_file(path_or_fileobj=str(f), repo_id=repo_id, repo_type="dataset",
+                    path_in_repo=f"generations/{slug}/{f.name}",
+                    commit_message=f"Extend {slug}/{QWEN3_POOL} to >=K={TARGET_K3} "
+                                   f"({len(combined)} rollouts)")
+print("uploaded", f"generations/{slug}/{QWEN3_POOL}.parquet")
+```
+
+<!-- md -->
+# ▂▂▂▂▂▂▂▂▂▂▂▂
+
+<!-- md -->
+## Notes — truncation & length-extend (forward-looking)
+
+- **Truncation / budget.** `terminal` (`emitted_eos` vs `truncated`) and the per-row
+  `max_gen_len` record how each rollout ended. Because they're per-row, a pool can
+  mix budgets — which sets up a future **length-extend**: re-generate the
+  `terminal == "truncated"` rows at a higher cap and update them in place by
+  `ROLLOUT_KEY` (`model_id, unique_id, run_id, branch_path, sample_idx`), bumping
+  `max_gen_len`/`finish_reason`. (This notebook implements the *width*-extend —
+  more rollouts per problem.)
+- **Other thinking models** (e.g. DeepSeek-R1-Distill-Qwen-1.5B) work through the
+  same Example-3 flow — just swap the model id; the adapter registry picks the right
+  prompt template and `</think>` handling.

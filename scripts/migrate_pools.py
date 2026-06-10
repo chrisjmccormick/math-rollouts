@@ -52,10 +52,16 @@ RUN_LEGEND = {
 }
 
 
-def _is_natural_pool(cols) -> bool:
-    """A flat natural pool, not a forced-opener experiment or a derived table."""
-    cols = set(cols)
-    if {"guided", "branch_token_id", "branch_pos"} & cols:
+def _is_natural_pool(df) -> bool:
+    """A flat natural pool, not a forced-opener experiment or a derived table.
+    Forced files are flagged by the legacy dev-project columns (``guided`` /
+    ``branch_token_id``) or the guided-rollouts forced columns (``token_id`` /
+    ``opener_idx``); a guided-rollouts ``gather_method`` column is fine as long as
+    every row says natural."""
+    cols = set(df.columns)
+    if {"guided", "branch_token_id", "branch_pos", "token_id", "opener_idx"} & cols:
+        return False
+    if "gather_method" in cols and not set(df["gather_method"].unique()) <= {"natural"}:
         return False
     return {"completion_token_ids", "is_correct", "unique_id"} <= cols
 
@@ -96,7 +102,7 @@ def migrate_one(in_root: Path, out_root: Path, model_id: str, pool_path: Path,
     pool = pool_path.stem
     slug = model_slug(model_id)
     legacy = pd.read_parquet(pool_path)
-    if not _is_natural_pool(legacy.columns):
+    if not _is_natural_pool(legacy):
         print(f"  skip {slug}/{pool}.parquet (not a natural pool)")
         return
 
