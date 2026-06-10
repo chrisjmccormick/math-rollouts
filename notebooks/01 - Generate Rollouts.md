@@ -105,7 +105,10 @@ pip_url = f"math_rollouts[gen] @ git+https://{_auth}github.com/{GH_OWNER}/math-r
   Example 3 — it needs a much larger `max_tokens`).
 - `POOL` — output pool name → `generations/<slug>/<POOL>.parquet`.
 - `K` — rollouts per problem.
-- `SEED` — vLLM sampling seed (batch identity; stored on the rows).
+- `SEED` — vLLM sampling seed, stored on the rows. An int makes the batch
+  reproducible; `None` leaves vLLM unseeded (natural sampling — see Example 3).
+  Either way, never REUSE a seed across batches of the same pool: an identical
+  request with the same seed regenerates identical completions.
 
 <!-- code -->
 ```python
@@ -293,7 +296,11 @@ from math_rollouts.config import GenConfig
 QWEN3_MODEL = "Qwen/Qwen3-8B"
 QWEN3_POOL  = "math500_natural"   # pool name migrated from guided-rollouts
 TARGET_K3   = 64                  # top every problem up to at least this many
-SEED3       = 1
+# None = UNSEEDED (vLLM samples from fresh entropy) — the natural-sampling
+# convention for this pool, and what the legacy rows carry (seed null). Never
+# reuse a fixed seed across extension batches of the same pool: re-issuing an
+# identical request with the same seed regenerates identical completions.
+SEED3       = None
 OUT_ROOT    = "/content/math-rollouts-data"
 
 # Qwen3's recommended thinking-mode sampling (T=0.6, top_p=0.95) matches the
