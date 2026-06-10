@@ -41,6 +41,17 @@ def test_registry_family_override_and_unknown():
         get_adapter("totally/unregistered")
 
 
+def test_sampling_overrides_per_family():
+    # Qwen3's vendor thinking-mode sampling adds top_k=20 (and the legacy qwen3
+    # pools were sampled with it — extension batches must match). Every other
+    # family samples with temperature + top-p only.
+    assert get_adapter("Qwen/Qwen3-8B").sampling_overrides() == {"top_k": 20}
+    assert get_adapter("Qwen/Qwen2.5-Math-1.5B").sampling_overrides() == {}
+    assert get_adapter("sail/Qwen2.5-Math-1.5B-Oat-Zero").sampling_overrides() == {}
+    assert get_adapter("Qwen/Qwen3-8B-Base").sampling_overrides() == {}
+    assert get_adapter("deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B").sampling_overrides() == {}
+
+
 def test_deepseek_think_ids_differ_from_qwen3():
     # The R1-distill reasoning tokens are 151648/151649, NOT Qwen3's 151667/151668.
     # The </think> STRING is shared, so post-think scoring is unchanged; the ids are

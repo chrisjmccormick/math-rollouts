@@ -48,3 +48,10 @@ class Qwen3ThinkAdapter(ModelAdapter):
 
     def vllm_stop(self) -> list[str]:
         return []
+
+    def sampling_overrides(self) -> dict:
+        # Vendor thinking-mode sampling (generation_config.json): T=0.6, top_p=0.95,
+        # top_k=20. T/top_p already match the project defaults; top_k is extra — and
+        # the legacy qwen3-8b pools were sampled WITH it (rows carry top_k=20), so
+        # extension batches must keep it or the pool mixes distributions.
+        return {"top_k": 20}

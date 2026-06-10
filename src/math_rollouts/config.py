@@ -20,10 +20,12 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 class GenConfig:
     """Sampling + nucleus config, fixed across the project's canonical runs.
 
-    Rollouts are sampled with ``temperature`` + ``top_p`` only. ``top_k`` does NOT
-    limit generation — it caps the **nucleus** fan-out (the first-token / branch
-    set, computed on temperature-scaled probs, capped at ``top_k``) and the size of
-    the post-hoc per-token nucleus store (``analysis.token_nuclei``).
+    Rollouts are sampled with ``temperature`` + ``top_p``, plus any per-family
+    ``adapter.sampling_overrides()`` (e.g. Qwen3's vendor thinking-mode
+    ``top_k=20``). This config's ``top_k`` is UNRELATED to sampling — it caps the
+    **nucleus** fan-out (the first-token / branch set, computed on
+    temperature-scaled probs, capped at ``top_k``) and the size of the post-hoc
+    per-token nucleus store (``analysis.token_nuclei``).
     """
 
     temperature: float = 0.6

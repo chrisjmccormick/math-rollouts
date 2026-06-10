@@ -303,8 +303,11 @@ TARGET_K3   = 64                  # top every problem up to at least this many
 SEED3       = None
 OUT_ROOT    = "/content/math-rollouts-data"
 
-# Qwen3's recommended thinking-mode sampling (T=0.6, top_p=0.95) matches the
-# project defaults; only the budget changes. max_model_len covers prompt + budget.
+# Qwen3's vendor thinking-mode sampling is T=0.6, top_p=0.95, top_k=20: T/top_p
+# match the project defaults, and the adapter's sampling_overrides() adds the
+# top_k=20 automatically (the legacy pool's batches were sampled with it — new
+# batches must match). So only the budget changes here; max_model_len covers
+# prompt + budget.
 THINK_CFG = GenConfig(max_tokens=16384, max_model_len=18432)
 ```
 
@@ -381,6 +384,7 @@ authoritative record — that is what `benchmark@budget` keys off). The
 ```python
 from pathlib import Path
 from huggingface_hub import HfApi
+from math_rollouts.adapters import get_adapter
 from math_rollouts.data.hf import model_slug
 
 slug = model_slug(QWEN3_MODEL)
@@ -389,7 +393,8 @@ pools.write_pool(combined, out)
 pools.write_pool_meta(
     out.with_suffix(".meta.json"), model_id=QWEN3_MODEL, pool=QWEN3_POOL,
     default_reporting_scorer=pools.default_scorer_id(QWEN3_MODEL),  # post-think-v1
-    gen_config=THINK_CFG.as_dict(),
+    gen_config=dict(THINK_CFG.as_dict(),
+                    sampling_overrides=get_adapter(QWEN3_MODEL).sampling_overrides()),
     runs=[{"run_id": int(r), "n_rollouts": int((combined.run_id == r).sum())}
           for r in sorted(combined.run_id.unique())],
     df=combined,

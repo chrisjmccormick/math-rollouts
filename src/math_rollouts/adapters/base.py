@@ -39,3 +39,12 @@ class ModelAdapter(ABC):
     def vllm_stop(self) -> list[str]:
         """Stop strings for vLLM forced rollouts (e.g. the chat end token)."""
         return []
+
+    def sampling_overrides(self) -> dict:
+        """Extra vLLM ``SamplingParams`` this family is sampled with, merged over
+        the GenConfig-derived params at generation time (the override wins for the
+        keys it names). ``{}`` for models sampled with temperature + top-p only;
+        a family whose vendor generation defaults add more (e.g. Qwen3's
+        thinking-mode ``top_k=20``) declares them HERE so every batch of a pool is
+        the same sampling distribution — never via ad-hoc per-model conditionals."""
+        return {}
