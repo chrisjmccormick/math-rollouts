@@ -39,8 +39,18 @@ def generate_natural(model_id: str, problems: list[dict], *, k,
     cfg = cfg or GenConfig()
     adapter = get_adapter(model_id)
     tok = tok or AutoTokenizer.from_pretrained(model_id)
-    llm = llm or LLM(model=model_id, dtype="bfloat16", gpu_memory_utilization=0.9,
-                     max_model_len=cfg.max_model_len)
+    if llm is None:
+        # vLLM V1 treats ENGINE seed None as 0 (a fixed RNG): an identical request
+        # set re-run in a fresh session would regenerate identical completions. For
+        # unseeded (natural) sampling the engine must get fresh entropy; when `seed`
+        # IS set, per-request SamplingParams seeds govern and this just matches.
+        import secrets
+        engine_seed = seed if seed is not None else secrets.randbits(31)
+        print(f"[generate_natural] engine seed {engine_seed}"
+              f"{' (fresh entropy; rows stay unseeded)' if seed is None else ''}",
+              flush=True)
+        llm = LLM(model=model_id, dtype="bfloat16", gpu_memory_utilization=0.9,
+                  max_model_len=cfg.max_model_len, seed=engine_seed)
 
     def _n_for(uid: str) -> int:
         return int(k) if not isinstance(k, dict) else int(k.get(uid, 0))
