@@ -42,6 +42,11 @@ def _eos_excluded_count(token_ids, eos_id) -> int:
     return n
 
 
+def _null_if_nan(v):
+    """None for a float NaN (how pandas surfaces a null list cell in row dicts)."""
+    return None if isinstance(v, float) and v != v else v
+
+
 def _is_thinking(model_id) -> bool:
     """Whether ``model_id``'s adapter is a thinking model (False if unset)."""
     if not model_id:
@@ -65,7 +70,11 @@ def row_attributes(row: dict, *, tok=None, prompt_len=None, eos_id=None,
     ``answer_matches`` == the model's default ``post-think-v1`` verdict, which the
     analysis stack reads directly). A thinking completion that never closed ``</think>``
     (e.g. truncated mid-thought) has no committed answer → ``answer_matches`` False.
-    Non-thinking models score the whole completion (region == full text)."""
+    Non-thinking models score the whole completion (region == full text).
+
+    A row with NULL ``completion_token_ids`` (some legacy pools never stored them)
+    gets null token-derived lengths (``completion_num_tokens``/``total_num_tokens``/
+    ``answer_token_frac``) rather than a fabricated 0 — text facts are unaffected."""
     from ..analysis.positional import has_boxed, verified_answer_char_pos
     from ..score.scorers import (THINK_CLOSE_STR, answer_matches as _answer_matches,
                                  derive_terminal)
@@ -83,13 +92,12 @@ def row_attributes(row: dict, *, tok=None, prompt_len=None, eos_id=None,
     hb = bool(has_boxed(region))
     rpos = verified_answer_char_pos(region, answer)
     pos = region_start + rpos if rpos is not None else None
-    cti = row.get("completion_token_ids")
-    ids = list(cti) if cti is not None else []
+    cti = _null_if_nan(row.get("completion_token_ids"))
 
     comp_n = row.get("completion_num_tokens")
-    if comp_n is None:
-        comp_n = _eos_excluded_count(ids, eos_id)
-    comp_n = int(comp_n)
+    if comp_n is None and cti is not None:
+        comp_n = _eos_excluded_count(list(cti), eos_id)
+    comp_n = int(comp_n) if comp_n is not None else None
 
     p_n = row.get("prompt_num_tokens")
     if p_n is None:
@@ -97,14 +105,14 @@ def row_attributes(row: dict, *, tok=None, prompt_len=None, eos_id=None,
     p_n = int(p_n) if p_n is not None else None
 
     frac = row.get("answer_token_frac")
-    if frac is None and pos is not None and tok is not None:
+    if frac is None and pos is not None and tok is not None and comp_n:
         n_before = len(tok.encode(text[:pos], add_special_tokens=False))
-        frac = n_before / max(comp_n, 1)
+        frac = n_before / comp_n
 
     terminal = row.get("terminal") or derive_terminal(row.get("finish_reason"),
                                                        row.get("stop_reason"))
     total_n = row.get("total_num_tokens")
-    if total_n is None and p_n is not None:
+    if total_n is None and p_n is not None and comp_n is not None:
         total_n = p_n + comp_n
 
     return {
@@ -134,17 +142,21 @@ def compute_raw_attributes(rows: list[dict], *, tok=None,
 def add_dup_index(df):
     """Assign ``dup_index``: 0 for the first occurrence of an identical completion
     within a problem, 1,2,... for natural repeats. Identity is the exact
-    ``completion_token_ids`` sequence (the precise notion of a distinct completion).
+    ``completion_token_ids`` sequence (the precise notion of a distinct completion);
+    rows with NULL token ids (some legacy pools never stored them) fall back to the
+    exact ``completion_text`` instead — never to a shared sentinel, which would mark
+    every null-id rollout in a problem as a duplicate of the first.
     Deterministic order by ``(unique_id, run_id, sample_idx)``. Duplicate completions
     are KEPT (legitimate near-deterministic behaviour + needed for pass@k); the flag
     lets analysis filter to distinct completions (``dup_index == 0``)."""
     d = df.copy()
     d["_ord"] = range(len(d))
-    d["_cid"] = d["completion_token_ids"].map(
-        lambda x: tuple(int(t) for t in x) if x is not None else ())
+    d["_cid"] = [tuple(int(t) for t in ids) if _null_if_nan(ids) is not None
+                 else ("text", text)
+                 for ids, text in zip(d["completion_token_ids"], d["completion_text"])]
     sort_cols = [c for c in ("unique_id", "run_id", "sample_idx") if c in d.columns]
     d = d.sort_values(sort_cols + ["_ord"], kind="stable")
-    d["dup_index"] = d.groupby(["unique_id", "_cid"]).cumcount().astype("int32")
+    d["dup_index"] = d.groupby(["unique_id", "_cid"], sort=False).cumcount().astype("int32")
     d = d.sort_values("_ord", kind="stable").drop(columns=["_ord", "_cid"])
     return d.reset_index(drop=True)
 

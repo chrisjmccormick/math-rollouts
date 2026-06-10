@@ -48,13 +48,21 @@ def _new_from_math12k(old: str, split: str) -> str:
     return "/".join([split, *old.split("/")[1:]])
 
 
-def build_maps(in_root: Path):
+def build_maps(mp: pd.DataFrame, m500: pd.DataFrame):
     """Combined map old_id -> new_id (both train/... and test/...json sources), plus
-    the new HF cross-ref rows (new_id, hf_math500_id)."""
-    mp = pd.read_parquet(in_root / "problems" / "math_problems.parquet")
-    split_map = {u: _new_from_math12k(u, s) for u, s in zip(mp.unique_id, mp.split)}
+    the new HF cross-ref rows (new_id, hf_math500_id). ``mp``/``m500`` are the
+    ``problems/math_problems.parquet`` / ``problems/math500.parquet`` tables.
 
-    m500 = pd.read_parquet(in_root / "problems" / "math500.parquet")
+    Works against the tables before OR after their own re-key: every problem is also
+    registered under its legacy math12k alias ``train/<subj>/<n>`` (every math12k row
+    was ``train/...`` regardless of split), and an already-new id maps to itself —
+    so the map stays total over all three source formats."""
+    split_map = {}
+    for u, s in zip(mp.unique_id, mp.split):
+        new = _new_from_math12k(u, s)
+        split_map[u] = new
+        split_map["/".join(["train", *u.split("/")[1:]])] = new
+
     hf_to_new, cross = {}, []
     for train_id, hf_id in zip(m500.unique_id, m500.math500_native_id):
         new_id = split_map[train_id]
@@ -112,7 +120,8 @@ def main() -> None:
     out_root = a.out_root
     out_root.mkdir(parents=True, exist_ok=True)
 
-    cmap, cross = build_maps(in_root)
+    cmap, cross = build_maps(pd.read_parquet(in_root / "problems" / "math_problems.parquet"),
+                             pd.read_parquet(in_root / "problems" / "math500.parquet"))
     print(f"map covers {len(cmap)} source ids "
           f"({sum(v.startswith('math500/') for v in set(cmap.values()))} math500)")
 

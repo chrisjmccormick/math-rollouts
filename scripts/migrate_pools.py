@@ -54,12 +54,14 @@ RUN_LEGEND = {
 
 def _is_natural_pool(df) -> bool:
     """A flat natural pool, not a forced-opener experiment or a derived table.
-    Forced files are flagged by the legacy dev-project columns (``guided`` /
-    ``branch_token_id``) or the guided-rollouts forced columns (``token_id`` /
-    ``opener_idx``); a guided-rollouts ``gather_method`` column is fine as long as
-    every row says natural."""
+    Forced files are flagged by the legacy dev-project columns (``branch_token_id``)
+    or the guided-rollouts forced columns (``token_id`` / ``opener_idx``). The
+    guided-rollouts ``guided``/``gather_method`` columns exist on NATURAL files too
+    (all-False / 'natural'), so those are checked by VALUE, not presence."""
     cols = set(df.columns)
-    if {"guided", "branch_token_id", "branch_pos", "token_id", "opener_idx"} & cols:
+    if {"branch_token_id", "branch_pos", "token_id", "opener_idx"} & cols:
+        return False
+    if "guided" in cols and bool(df["guided"].any()):
         return False
     if "gather_method" in cols and not set(df["gather_method"].unique()) <= {"natural"}:
         return False
