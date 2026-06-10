@@ -8,12 +8,20 @@ crashing. (Mirrors the source project's ``run_random_nothink.py`` recipe.)
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, asdict
 
 # Must be set before `import vllm` anywhere downstream. setdefault so an explicit
 # override in the environment still wins.
 os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
 os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
+
+# Under a Jupyter/Colab kernel, run the V1 engine IN-PROCESS: the engine-core
+# subprocess dies opaquely there ("Failed core proc(s): {}" with the root cause
+# swallowed), and the in-process path lets generate.natural's stdio guard handle
+# ipykernel's fileno-less streams (vLLM init calls sys.stdout.fileno()).
+if "ipykernel" in sys.modules:
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
 
 
 @dataclass(frozen=True)

@@ -11,7 +11,41 @@ flat-pool assembly happen on CPU in ``data.pools``.
 """
 from __future__ import annotations
 
+import os
+import sys
+from contextlib import contextmanager
+
 from ..config import GenConfig
+
+
+@contextmanager
+def _filenoable_stdio():
+    """vLLM engine init calls ``sys.stdout.fileno()`` (its ``suppress_stdout`` around
+    the gloo group setup), which ipykernel's stream wrappers raise on — the classic
+    Colab/Jupyter ``UnsupportedOperation: fileno`` crash. Swap any fileno-less
+    stream for devnull JUST for the wrapped block; vLLM's loggers hold the original
+    notebook streams, so init logging still displays."""
+    def _broken(stream):
+        try:
+            stream.fileno()
+            return False
+        except Exception:
+            return True
+
+    swap_out, swap_err = _broken(sys.stdout), _broken(sys.stderr)
+    if not (swap_out or swap_err):
+        yield
+        return
+    old_out, old_err = sys.stdout, sys.stderr
+    with open(os.devnull, "w") as devnull:
+        if swap_out:
+            sys.stdout = devnull
+        if swap_err:
+            sys.stderr = devnull
+        try:
+            yield
+        finally:
+            sys.stdout, sys.stderr = old_out, old_err
 
 
 def generate_natural(model_id: str, problems: list[dict], *, k,
@@ -49,8 +83,9 @@ def generate_natural(model_id: str, problems: list[dict], *, k,
         print(f"[generate_natural] engine seed {engine_seed}"
               f"{' (fresh entropy; rows stay unseeded)' if seed is None else ''}",
               flush=True)
-        llm = LLM(model=model_id, dtype="bfloat16", gpu_memory_utilization=0.9,
-                  max_model_len=cfg.max_model_len, seed=engine_seed)
+        with _filenoable_stdio():
+            llm = LLM(model=model_id, dtype="bfloat16", gpu_memory_utilization=0.9,
+                      max_model_len=cfg.max_model_len, seed=engine_seed)
 
     def _n_for(uid: str) -> int:
         return int(k) if not isinstance(k, dict) else int(k.get(uid, 0))
