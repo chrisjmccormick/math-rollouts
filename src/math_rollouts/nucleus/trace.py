@@ -58,7 +58,7 @@ def trace_nuclei(
     for t, chosen_id in enumerate(comp):
         row = logits[base + t - 1].float()
         ids, probs = compute_nucleus(
-            row, temperature=cfg.temperature, top_p=cfg.top_p, top_k=cfg.top_k,
+            row, temperature=cfg.temperature, top_p=cfg.top_p,
         )
         prob_by_id = dict(zip(ids, probs))
         chosen_id = int(chosen_id)

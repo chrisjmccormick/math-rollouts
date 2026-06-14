@@ -56,7 +56,7 @@ def test_trace_matches_recipe_per_step():
     for t, chosen in enumerate(completion):
         row = full[base + t - 1].float()
         ids, probs = compute_nucleus(row, temperature=cfg.temperature,
-                                     top_p=cfg.top_p, top_k=cfg.top_k)
+                                     top_p=cfg.top_p)
         assert steps[t]["step"] == t
         assert steps[t]["chosen_id"] == chosen
         assert steps[t]["chosen_str"] == f"<{chosen}>"

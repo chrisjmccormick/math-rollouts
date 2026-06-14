@@ -24,6 +24,12 @@ from transformers.cache_utils import DynamicCache
 
 from .recipe import compute_nucleus
 
+# How many nucleus members the tree EXPANDS per fork by default. This bounds the
+# (potentially exponential) DFS walk — it is NOT a nucleus-size cap: the nucleus
+# itself is measured at its true top-p width (``branch_size``); we just don't
+# recurse into more than this many of its members. Override via ``max_branch``.
+DEFAULT_MAX_BRANCH = 20
+
 
 class NucleusTree:
     def __init__(self, model, tok, adapter, cfg, *, max_depth: int = 1,
@@ -31,7 +37,7 @@ class NucleusTree:
                  device: str = "cuda"):
         self.model, self.tok, self.adapter, self.cfg = model, tok, adapter, cfg
         self.max_depth = max_depth
-        self.max_branch = max_branch if max_branch is not None else cfg.top_k
+        self.max_branch = max_branch if max_branch is not None else DEFAULT_MAX_BRANCH
         self.node_budget = node_budget
         self.device = device
         self.terminals = adapter.terminal_ids(tok)   # token_id -> reason
@@ -41,9 +47,10 @@ class NucleusTree:
     # ---- model / nucleus ----
     def _nucleus(self, logits):
         """Renormalized nucleus via the shared recipe (``recipe.compute_nucleus``):
-        softmax(logits/T), top_k cap, top_p keep (always keep the top token)."""
+        softmax(logits/T), top_p keep (always keep the top token). Returns the full
+        nucleus; ``_expand`` bounds how many members it recurses into."""
         return compute_nucleus(logits, temperature=self.cfg.temperature,
-                               top_p=self.cfg.top_p, top_k=self.cfg.top_k)
+                               top_p=self.cfg.top_p)
 
     def _prime(self, ids):
         self.cache = DynamicCache()

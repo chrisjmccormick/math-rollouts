@@ -57,19 +57,17 @@ def filenoable_stdio():
 
 @dataclass(frozen=True)
 class GenConfig:
-    """Sampling + nucleus config, fixed across the project's canonical runs.
+    """Sampling config, fixed across the project's canonical runs.
 
     Rollouts are sampled with ``temperature`` + ``top_p``, plus any per-family
-    ``adapter.sampling_overrides()`` (e.g. Qwen3's vendor thinking-mode
-    ``top_k=20``). This config's ``top_k`` is UNRELATED to sampling — it caps the
-    **nucleus** fan-out (the first-token / branch set, computed on
-    temperature-scaled probs, capped at ``top_k``) and the size of the post-hoc
-    per-token nucleus store (``analysis.token_nuclei``).
+    ``adapter.sampling_overrides()`` — e.g. Qwen3's vendor thinking-mode
+    ``top_k=20``, a real vLLM *sampling* limiter owned by the adapter. Nucleus
+    sizes (the first-token / branch set and the per-token store in
+    ``analysis.token_nuclei``) are measured at their TRUE top-p extent, uncapped.
     """
 
     temperature: float = 0.6
     top_p: float = 0.95
-    top_k: int = 20          # nucleus-size cap ONLY (not a sampling limiter)
     max_tokens: int = 3000   # max generated tokens per rollout
     max_model_len: int = 4096
 
@@ -79,10 +77,10 @@ class GenConfig:
         Carried on every rollout row so pooling across batches is deliberate: rows
         with different ``gen_config_id`` are NOT the same sampling distribution.
         """
-        if (self.temperature, self.top_p, self.top_k, self.max_tokens) == (0.6, 0.95, 20, 3000):
+        if (self.temperature, self.top_p, self.max_tokens) == (0.6, 0.95, 3000):
             return 200
         # Non-canonical configs get a deterministic-ish hash id in a separate band.
-        return 900 + (hash((self.temperature, self.top_p, self.top_k, self.max_tokens)) % 99)
+        return 900 + (hash((self.temperature, self.top_p, self.max_tokens)) % 99)
 
     def as_dict(self) -> dict:
         return asdict(self)

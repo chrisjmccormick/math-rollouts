@@ -1,6 +1,6 @@
 """_sequence_kept: nucleus sizes match the canonical recipe, the keep-rule holds
-(2 for singletons, >=10 capped at top_k for branches), and the kept set always
-contains the full nucleus (so reachability can see "just outside").
+(2 for singletons, >= BRANCH_MIN for branches, uncapped above), and the kept set
+always contains the full nucleus (so reachability can see "just outside").
 """
 from __future__ import annotations
 
@@ -24,18 +24,18 @@ def test_sizes_keeprule_and_nucleus_subset():
     chosen = torch.randint(0, V, (T,), generator=g)
 
     sizes, is_top1, keepn, ids_flat, logit_flat = _sequence_kept(
-        logits, chosen, temperature=cfg.temperature, top_p=cfg.top_p, top_k=cfg.top_k)
+        logits, chosen, temperature=cfg.temperature, top_p=cfg.top_p)
 
     # Flat arrays split on keep_counts and total to their sum.
     assert ids_flat.shape == logit_flat.shape == (int(keepn.sum()),)
     off = 0
     for t in range(T):
         ids, _ = compute_nucleus(logits[t], temperature=cfg.temperature,
-                                 top_p=cfg.top_p, top_k=cfg.top_k)
+                                 top_p=cfg.top_p)
         size = len(ids)
         assert int(sizes[t]) == size, t
-        # keep-rule
-        expect_keep = SINGLETON_KEEP if size == 1 else min(max(size, BRANCH_MIN), cfg.top_k)
+        # keep-rule (uncapped above BRANCH_MIN)
+        expect_keep = SINGLETON_KEEP if size == 1 else max(size, BRANCH_MIN)
         assert int(keepn[t]) == expect_keep, t
         # the kept set's first `size` ids ARE the nucleus (kept is a superset)
         kept_ids = ids_flat[off:off + expect_keep]
@@ -53,7 +53,7 @@ def test_unpack_roundtrip():
     logits = torch.randn(20, 2000, generator=g)
     chosen = torch.randint(0, 2000, (20,), generator=g)
     _, _, keepn, ids_flat, logit_flat = _sequence_kept(
-        logits, chosen, temperature=cfg.temperature, top_p=cfg.top_p, top_k=cfg.top_k)
+        logits, chosen, temperature=cfg.temperature, top_p=cfg.top_p)
     row = {"keep_counts": keepn.tolist(), "kept_ids": ids_flat.tolist(),
            "kept_logits": logit_flat.tolist()}
     per_pos = unpack_kept(row)

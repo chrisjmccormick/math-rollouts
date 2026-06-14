@@ -15,17 +15,20 @@ torch = pytest.importorskip("torch")
 
 from math_rollouts.config import GenConfig
 from math_rollouts.nucleus import NucleusTree, leaf_openers
+from math_rollouts.nucleus.tree import DEFAULT_MAX_BRANCH
 
-T, TOP_P, TOPK = 0.6, 0.95, 20
+T, TOP_P = 0.6, 0.95
 
 
 def _legacy_nucleus(logits):
-    """Verbatim openings_k16 first-token recipe (the parity target)."""
+    """Verbatim openings_k16 first-token recipe (the parity target). Uncapped: the
+    nucleus is the true top-p set; the tree separately bounds how many members it
+    EXPANDS (``DEFAULT_MAX_BRANCH``)."""
     probs = torch.softmax(logits.float() / T, dim=-1)
     sp, si = torch.sort(probs, descending=True)
     keep = (torch.cumsum(sp, 0) - sp) < TOP_P
     keep[0] = True
-    nuc_ids = si[keep][:TOPK]
+    nuc_ids = si[keep]
     nuc_p = probs[nuc_ids]
     nuc_p = (nuc_p / nuc_p.sum()).tolist()
     nuc_ids = [int(t) for t in nuc_ids.tolist()]
@@ -93,7 +96,7 @@ def test_depth1_build_produces_single_token_openers():
     openers = leaf_openers(root, tok)
     lids, lprobs = _legacy_nucleus(logits)
 
-    assert len(openers) == min(len(lids), cfg.top_k)
+    assert len(openers) == min(len(lids), DEFAULT_MAX_BRANCH)
     for i, (op, tid) in enumerate(zip(openers, lids)):
         assert op["depth"] == 1
         assert op["branch_path"] == [i]

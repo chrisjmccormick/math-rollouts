@@ -58,8 +58,9 @@ def generate_natural(model_id: str, problems: list[dict], *, k,
 
     def _sp(n: int):
         # Sampling is temperature + top-p, PLUS the adapter's per-family overrides
-        # (e.g. Qwen3's vendor thinking-mode top_k=20). cfg.top_k is unrelated: a
-        # post-hoc nucleus-size cap (see analysis.token_nuclei), NOT a sampling knob.
+        # (e.g. Qwen3's vendor thinking-mode top_k=20 — a real vLLM sampling limiter
+        # owned by the adapter). Nucleus SIZE is measured post-hoc and uncapped (see
+        # analysis.token_nuclei); there is no nucleus-size cap knob anymore.
         kw = dict(n=n, temperature=cfg.temperature, top_p=cfg.top_p,
                   max_tokens=cfg.max_tokens, stop=adapter.vllm_stop())
         kw.update(adapter.sampling_overrides())

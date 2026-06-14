@@ -10,8 +10,8 @@ records the **nucleus size** plus a compact, frugal slice of the distribution:
   * **branches** (size >= 2): keep ``max(size, 10)`` tokens — at least 10, so the
     visualization can show alternates just *outside* the nucleus and a reachability
     check can tell "outside the nucleus but barely" from "far down". The nucleus
-    size is recorded **uncapped** (``top_k=None`` → the true top-p size, which on a
-    flat distribution can run to thousands of tokens), so the kept slice is uncapped
+    size is recorded at its **true top-p extent** — uncapped, so on a flat
+    distribution it can run to thousands of tokens — and the kept slice is uncapped
     too; in practice nuclei are tiny on average, so the store stays small. Because
     sizes are uncapped, ``nuc_sizes`` and ``keep_counts`` are stored as **int32**
     (int16 would overflow a >32767-token nucleus to a negative).
@@ -54,14 +54,18 @@ SINGLETON_KEEP = 2
 BRANCH_MIN = 10
 
 
-def _sequence_kept(gen_logits, chosen_ids, *, temperature, top_p, top_k,
+def _sequence_kept(gen_logits, chosen_ids, *, temperature, top_p,
                    pos_chunk: int = 512):
-    """Vectorized per-position nucleus + frugal kept slice for one sequence.
+    """Vectorized per-position TRUE top-p nucleus + frugal kept slice for one sequence.
 
     ``gen_logits`` [T, V] predict each completion token; ``chosen_ids`` [T] are
-    those tokens. Returns numpy arrays ``(sizes, is_top1, keep_counts,
-    kept_ids_flat, kept_logits_flat)``; the flat arrays concatenate each position's
-    kept entries (position-major, rank order) and split on ``keep_counts``.
+    those tokens. The nucleus size is the FULL top-p extent — uncapped, so on a flat
+    distribution (where top-p "fails") it is recorded at its true width of hundreds
+    or thousands of tokens rather than silently censored. Returns numpy arrays
+    ``(sizes, is_top1, keep_counts, kept_ids_flat, kept_logits_flat)``; the flat
+    arrays concatenate each position's kept entries (position-major, rank order) and
+    split on ``keep_counts``. Sorting is chunked over positions (``pos_chunk``) to
+    bound the [chunk, V] sort footprint regardless of rollout length.
     """
     import torch
 
@@ -69,27 +73,26 @@ def _sequence_kept(gen_logits, chosen_ids, *, temperature, top_p, top_k,
     for s in range(0, gen_logits.shape[0], pos_chunk):
         gl = gen_logits[s:s + pos_chunk].float()
         ch = chosen_ids[s:s + pos_chunk]
-        # top_k is a storage/size cap; top_k=None means UNCAPPED (full vocab), so the
-        # true top-p nucleus size is recorded even where it runs to hundreds of tokens
-        # (flat distributions where top-p "fails"). Those rare cases are left pure for
-        # analysis to filter rather than silently censored.
-        k_eff = gl.shape[-1] if top_k is None else min(top_k, gl.shape[-1])
-        lse = torch.logsumexp(gl / temperature, dim=-1, keepdim=True)
-        # topk on raw logits == topk on scaled (monotonic); store the RAW logit.
-        top_raw, top_idx = torch.topk(gl, k_eff, dim=-1)
-        top_prob = torch.exp(top_raw / temperature - lse)
-        csum = torch.cumsum(top_prob, dim=-1)
-        keep = (csum - top_prob) < top_p
+        # Sort the FULL vocab by probability — identical to the canonical recipe
+        # (``nucleus.recipe.compute_nucleus``) — so the store's nucleus matches the one
+        # the viz/tree see, tail order included. The kept slice stores the RAW logit
+        # (pre-temperature — recompute any T/prob downstream), gathered into that order.
+        pr = torch.softmax(gl / temperature, dim=-1)
+        srt_prob, srt_idx = torch.sort(pr, dim=-1, descending=True)
+        srt_raw = torch.gather(gl, -1, srt_idx)
+        csum = torch.cumsum(srt_prob, dim=-1)
+        keep = (csum - srt_prob) < top_p
         keep[:, 0] = True
-        size = keep.sum(dim=-1)                                   # [t], 1..k_eff
+        size = keep.sum(dim=-1)                                   # [t], 1..V (uncapped)
         keep_n = torch.where(size <= 1, torch.full_like(size, SINGLETON_KEEP),
-                             torch.clamp(size, min=BRANCH_MIN))    # max already <= k_eff
-        store = torch.arange(k_eff, device=gl.device).unsqueeze(0) < keep_n.unsqueeze(1)
-        sizes_l.append(size.to(torch.int32))   # uncapped (top_k=None) -> can exceed int16
-        top1_l.append(top_idx[:, 0] == ch)
+                             torch.clamp(size, min=BRANCH_MIN))
+        kmax = int(keep_n.max())            # gather only the columns some position keeps
+        store = torch.arange(kmax, device=gl.device).unsqueeze(0) < keep_n.unsqueeze(1)
+        sizes_l.append(size.to(torch.int32))    # uncapped -> can exceed int16
+        top1_l.append(srt_idx[:, 0] == ch)
         keepn_l.append(keep_n.to(torch.int32))  # = size for branches, so also uncapped
-        ids_l.append(top_idx[store])
-        logit_l.append(top_raw[store])
+        ids_l.append(srt_idx[:, :kmax][store])
+        logit_l.append(srt_raw[:, :kmax][store])
     return (torch.cat(sizes_l).cpu().numpy(), torch.cat(top1_l).cpu().numpy(),
             torch.cat(keepn_l).cpu().numpy(), torch.cat(ids_l).cpu().numpy(),
             torch.cat(logit_l).float().cpu().numpy())
@@ -152,10 +155,10 @@ def _write_shard(path: Path, rows: list[dict], pa_logit) -> None:
 def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                        limit: int | None = None, shard_size: int = 1,
                        max_batch_tokens: int = 24000, device: str = "cuda",
-                       logit_dtype: str = "float16", progress_every: int = 50,
-                       top_k: int | None = None):
+                       logit_dtype: str = "float16", progress_every: int = 50):
     """Compute the per-token nucleus store for ``pool`` and write sharded parquets +
-    ``_stats.json`` + ``_meta.json``. Returns ``(stats, paths)``."""
+    ``_stats.json`` + ``_meta.json``. Returns ``(stats, paths)``. Nucleus sizes are
+    recorded at their true top-p extent (uncapped)."""
     import pyarrow as pa
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -205,8 +208,6 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
     shard_dir = Path(out_dir) / "generations" / slug / f"{pool}_token_nuclei"
     shard_dir.mkdir(parents=True, exist_ok=True)
 
-    # top_k=-1 (or any negative) disables the cap entirely -> uncapped (None).
-    K = None if (top_k is not None and top_k < 0) else (top_k if top_k is not None else cfg.top_k)
     # Headline counters only. The full size distribution, per-difficulty bands, and
     # correct/incorrect splits are now computed POST-HOC from the written shards by
     # ``math_rollouts.analysis.nuclei_stats.summarize_nuclei`` — keeping this compute
@@ -235,7 +236,7 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                 plen, T = len(it["prompt"]), len(it["comp"])
                 sizes, top1, keepn, ids_flat, logit_flat = _sequence_kept(
                     logits[i, plen - 1:plen - 1 + T], input_ids[i, plen:plen + T],
-                    temperature=cfg.temperature, top_p=cfg.top_p, top_k=K)
+                    temperature=cfg.temperature, top_p=cfg.top_p)
                 r = it["row"]
                 rows.append({
                     "model_id": model_id, "unique_id": r["unique_id"],
@@ -274,9 +275,9 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
         "engine": "hf-teacher-forced", "dtype": "bfloat16",
         "logits": "raw (pre-temperature)", "logit_storage_dtype": logit_dtype,
         "temperature": cfg.temperature, "top_p": cfg.top_p,
-        "top_k": ("uncapped" if K is None else K),
+        "nucleus_size": "true top-p extent (uncapped)",
         "keep_rule": {"singleton_keep": SINGLETON_KEEP, "branch_min": BRANCH_MIN,
-                      "branch_max": ("uncapped" if K is None else K)},
+                      "branch_max": "uncapped"},
         "n_rollouts": n_done, "n_problems": len(problems), "shard_size": shard_size,
         "columns": "kept_ids/kept_logits are FLAT, split per position on keep_counts "
                    "(see math_rollouts.analysis.token_nuclei.unpack_kept)",
@@ -312,17 +313,12 @@ def main() -> None:
     ap.add_argument("--logit-dtype", default="float16", choices=["float16", "float32"],
                     help="float16 (default) matches the bf16 compute precision and halves "
                          "the logit bytes; use float32 if your pyarrow can't write float16")
-    ap.add_argument("--top-k", type=int, default=None,
-                    help="cap on the recorded nucleus size, a storage bound only "
-                         "(default: GenConfig.top_k = 20); the rollouts themselves were "
-                         "NOT sampled with a top_k limiter. Raise to see larger nuclei")
     ap.add_argument("--max-batch-tokens", type=int, default=24000)
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     build_token_nuclei(a.model_id, a.pool, a.out_root, limit=a.limit,
                        shard_size=a.shard_size, logit_dtype=a.logit_dtype,
-                       top_k=a.top_k, max_batch_tokens=a.max_batch_tokens,
-                       device=a.device)
+                       max_batch_tokens=a.max_batch_tokens, device=a.device)
 
 
 if __name__ == "__main__":
