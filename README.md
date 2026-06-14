@@ -106,10 +106,10 @@ cells; convert with your `.md`↔`.ipynb` utility or run as a plain script), in 
 3. `03 - Analyze Rollout Nuclei` — CPU analysis of the nucleus store (even-K size
    stats, per-difficulty, position, correct/incorrect).
 
-One-off migration of the legacy pools to `POOL_SCHEMA`:
-`python scripts/migrate_pools.py --out-root <dir>` (CPU; derives the criterion-free
-attributes incl. `answer_matches` + `dup_index`, writes a reviewable copy + drift
-report, then upload).
+The legacy pools were migrated once to `POOL_SCHEMA` (CPU job deriving the
+criterion-free attributes incl. `answer_matches` + `dup_index`, with a reviewable
+copy + drift report). That completed one-off — code, plan, and drift results — is
+archived under `agent-ops/math-rollouts/2026-06-09_0654am_guided-rollouts-migration/`.
 
 ## Loading data
 
@@ -130,8 +130,8 @@ are fetched from the hub and cached.
 ## Provenance & migrations
 
 The base dataset was built once (recipe documented in the dataset card). The data has
-since been re-keyed to the split-aware id scheme — `scripts/migrate_unique_id_splits.py`
-records that transformation.
+since been re-keyed to the split-aware id scheme; that one-off transformation is
+recorded under `agent-ops/math-rollouts/2026-06-09_0654am_guided-rollouts-migration/`.
 
 ## Tests
 
