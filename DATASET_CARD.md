@@ -85,11 +85,15 @@ temperature = 0.6   top_p = 0.95   max_tokens = 3000   max_model_len = 4096
 ```
 
 Rollouts are sampled with **temperature + top-p only** — there is no `top_k` limiter
-on generation. (`top_k = 20` appears in the recorded `GenConfig` because the *post-hoc*
-per-token nucleus computation uses it as a cap on how many nucleus members it stores;
-that nucleus is computed on temperature-scaled probs, kept by top-p — always keeping
-the top token — then renormalized within the kept set.) Rows with a different
-`gen_config_id` are **not** the same sampling distribution — do not pool across them.
+on generation, so the Qwen2.5-Math (base + Oat-Zero) pool `*.meta.json` files record
+`"top_k": null`. The one exception is the thinking-mode **Qwen3-8B** pool, which is
+sampled with the vendor `top_k = 20` (a real vLLM sampling limiter owned by the
+adapter), so its rows and meta carry `top_k = 20`. Post-hoc per-token **nucleus sizes**
+are a separate, *analysis*-time quantity: measured at their true top-p extent
+(temperature-scaled probs kept by top-p, always keeping the top token, then renormalized
+within the kept set) and stored **uncapped** — the `*_token_nuclei` meta records
+`"top_k": "uncapped"`, not a generation setting. Rows with a different `gen_config_id`
+are **not** the same sampling distribution — do not pool across them.
 
 > **Precision matters.** Rollouts were sampled with **bfloat16** (vLLM). Some
 > first-token logits are nearly tied, so recomputing nucleus membership/probabilities
