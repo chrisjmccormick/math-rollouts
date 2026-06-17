@@ -153,12 +153,18 @@ def _write_shard(path: Path, rows: list[dict], pa_logit) -> None:
 
 
 def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
+                       temperature: float | None = None, top_p: float | None = None,
                        limit: int | None = None, shard_size: int = 1,
                        max_batch_tokens: int = 24000, device: str = "cuda",
                        logit_dtype: str = "float16", progress_every: int = 50):
     """Compute the per-token nucleus store for ``pool`` and write sharded parquets +
     ``_stats.json`` + ``_meta.json``. Returns ``(stats, paths)``. Nucleus sizes are
-    recorded at their true top-p extent (uncapped)."""
+    recorded at their true top-p extent (uncapped).
+
+    ``temperature`` / ``top_p`` set the regime at which the per-token nucleus is
+    measured. Default to ``GenConfig()`` (T=0.6, top_p=0.95) -- the canonical
+    thinking-pool regime. For self-consistent analysis on a non-canonical pool,
+    pass the same regime the pool was sampled with."""
     import pyarrow as pa
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -166,6 +172,10 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
     from ..adapters import get_adapter
 
     cfg = GenConfig()
+    if temperature is None:
+        temperature = cfg.temperature
+    if top_p is None:
+        top_p = cfg.top_p
     adapter = get_adapter(model_id)
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
     if tok.pad_token_id is None:
@@ -236,7 +246,7 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                 plen, T = len(it["prompt"]), len(it["comp"])
                 sizes, top1, keepn, ids_flat, logit_flat = _sequence_kept(
                     logits[i, plen - 1:plen - 1 + T], input_ids[i, plen:plen + T],
-                    temperature=cfg.temperature, top_p=cfg.top_p)
+                    temperature=temperature, top_p=top_p)
                 r = it["row"]
                 rows.append({
                     "model_id": model_id, "unique_id": r["unique_id"],
@@ -274,7 +284,7 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
         "model_id": model_id, "pool": pool,
         "engine": "hf-teacher-forced", "dtype": "bfloat16",
         "logits": "raw (pre-temperature)", "logit_storage_dtype": logit_dtype,
-        "temperature": cfg.temperature, "top_p": cfg.top_p,
+        "temperature": float(temperature), "top_p": float(top_p),
         "nucleus_size": "true top-p extent (uncapped)",
         "keep_rule": {"singleton_keep": SINGLETON_KEEP, "branch_min": BRANCH_MIN,
                       "branch_max": "uncapped"},
