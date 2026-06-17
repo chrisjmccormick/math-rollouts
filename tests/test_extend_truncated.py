@@ -145,6 +145,41 @@ def test_rows_at_or_over_budget_are_skipped(monkeypatch):
     assert fake_llm.calls == []
 
 
+def test_pandas_numpy_array_columns_dont_break_row_assembly(monkeypatch):
+    """When a pool is round-tripped through parquet, list columns come back as numpy
+    arrays. ``arr or []`` raises 'truth value of array is ambiguous' -- regression
+    guard for the bug hit on the 2026-06-17 base T=0.6 run."""
+    import numpy as np
+    pool = pd.DataFrame([
+        # Make branch_path/opener_token_ids/completion_token_ids numpy arrays, like
+        # pandas would yield after a parquet round-trip on the POOL_SCHEMA list columns.
+        _row(uid="u1", ids=(1, 2, 3),
+             branch_path=np.array([], dtype=np.int16),
+             opener_token_ids=np.array([], dtype=np.int32)),
+    ])
+    # completion_token_ids also becomes a numpy array.
+    pool["completion_token_ids"] = pool["completion_token_ids"].map(
+        lambda v: np.array(v, dtype=np.int32))
+    problems = [{"unique_id": "u1", "problem": "?", "answer": "42", "subject": "x"}]
+
+    class _Adapter:
+        def prompt_ids(self, p, tok): return [9, 9]
+        def vllm_stop(self): return []
+        def sampling_overrides(self): return {}
+    monkeypatch.setattr("math_rollouts.adapters.get_adapter", lambda _mid: _Adapter())
+
+    fake_llm = _FakeLLM([_FakeOutput(token_ids=[5, 6])])
+    out = extend_truncated("any-model", pool, problems,
+                           cfg=GenConfig(max_tokens=20, max_model_len=64),
+                           run_id=1, llm=fake_llm, tok=_FakeTok())
+    assert len(out) == 1
+    r = out[0]
+    assert r["branch_path"] == []
+    assert r["opener_token_ids"] == []
+    # The full trajectory is prefix + continuation.
+    assert r["completion_token_ids"] == [1, 2, 3, 5, 6]
+
+
 def test_rows_with_missing_problem_are_skipped(monkeypatch):
     """A truncated row whose unique_id isn't in `problems` is skipped (we can't
     rebuild the prompt without the problem)."""

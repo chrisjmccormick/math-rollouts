@@ -174,6 +174,16 @@ def extend_truncated(model_id: str, pool_df, problems: list[dict], *,
 
     from ..adapters import get_adapter
 
+    def _as_list(v):
+        """Pandas/parquet surfaces list cells as numpy arrays and null cells as NaN
+        floats; both break ``v or []`` (numpy raises on truthy check, NaN is truthy).
+        Fold both into a plain list/empty default."""
+        if v is None:
+            return []
+        if isinstance(v, float):                # pandas null cell -> NaN
+            return []
+        return list(v)
+
     adapter = get_adapter(model_id)
     tok = tok or AutoTokenizer.from_pretrained(model_id)
     prob_by_uid = {p["unique_id"]: p for p in problems}
@@ -240,15 +250,20 @@ def extend_truncated(model_id: str, pool_df, problems: list[dict], *,
         # The extended trajectory's text is the original truncated text + the
         # continuation text; vLLM only returns the continuation, so prepend the
         # original. (completion_text is for human inspection; the IDs are the truth.)
-        full_text = (r.get("completion_text") or "") + (c.text or "")
+        orig_text = r.get("completion_text")
+        if orig_text is None or (isinstance(orig_text, float)):
+            orig_text = ""
+        full_text = orig_text + (c.text or "")
+        depth = r.get("depth")
         rollouts.append({
             "model_id": model_id,
             "unique_id": r["unique_id"],
             "subject": r.get("subject"),
             "answer": r.get("answer"),
-            "depth": int(r.get("depth", 0) or 0),
-            "branch_path": list(r.get("branch_path") or []),
-            "opener_token_ids": list(r.get("opener_token_ids") or []),
+            "depth": int(depth) if depth is not None and not (isinstance(depth, float)
+                                                              and depth != depth) else 0,
+            "branch_path": _as_list(r.get("branch_path")),
+            "opener_token_ids": _as_list(r.get("opener_token_ids")),
             "run_id": run_id,
             "gen_config_id": gcid,
             "seed": seed,
