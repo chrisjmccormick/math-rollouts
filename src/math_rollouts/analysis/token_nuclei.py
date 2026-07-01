@@ -22,20 +22,25 @@ that generated the rollouts; that, plus the engine, is stamped in ``_meta.json``
 the "just outside the nucleus" comparison is only ever made between like-precision
 logits.
 
-Output (sharded per problem by default — small files the viz can load one at a
-time; use ``shard_size`` > 1 to bucket, e.g. for the larger math12k pools)::
+Output (a single ``token_nuclei.parquet`` — one per-rollout row per problem. The
+earlier per-problem sharding produced up to 500 tiny files per pool that tripped
+Windows path limits on clone/LFS checkout; nuclei stores stay small, so one file per
+pool is ample. Named ``token_nuclei.parquet`` — not ``nuclei.parquet`` — to avoid
+clashing with the experiment-level ``nuclei.parquet`` read by ``data.hf.load_nuclei``)::
 
     <out_dir>/generations/<model-slug>/<pool>_token_nuclei/
-        <shard>.parquet ...   per-rollout rows; see _write_shard for the columns
+        token_nuclei.parquet  per-rollout rows; see _rows_to_table for the columns
         _stats.json           headline counts only (rollouts / tokens / singleton %);
                               full size, difficulty, and correct/incorrect breakdowns
-                              are computed post-hoc from the shards by
+                              are computed post-hoc from the store by
                               ``analysis.nuclei_stats.summarize_nuclei``
         _meta.json            model / engine / dtype / config / keep-rule
 
 Per row the kept entries are stored FLAT (``kept_ids`` / ``kept_logits``) with a
 parallel ``keep_counts`` so they can be re-split per position without a list-of-
-lists column; see ``unpack_kept``.
+lists column; see ``unpack_kept``. Rows are streamed one problem's row-group at a
+time (``pyarrow.parquet.ParquetWriter``), so a per-``unique_id`` read stays cheap via
+row-group statistics pushdown (see ``data.hf.load_token_nuclei``).
 """
 from __future__ import annotations
 
@@ -125,15 +130,18 @@ def _pack_batches(items, max_batch_tokens: int):
     return batches
 
 
-def _write_shard(path: Path, rows: list[dict], pa_logit) -> None:
+def _rows_to_table(rows: list[dict], pa_logit):
+    """Arrow table for a batch of per-rollout rows. Column types are explicit (never
+    inferred from data), so every problem's row-group carries an identical schema —
+    safe to stream through a single ``ParquetWriter`` even when a batch is all-null in
+    some column, or empty."""
     import numpy as np
     import pyarrow as pa
-    import pyarrow.parquet as pq
 
     # PyArrow float16 rejects Python floats; cast numpy arrays to the target dtype first.
     np_logit = np.float16 if pa_logit == pa.float16() else np.float32
     col = lambda k, t: pa.array([r[k] for r in rows], type=t)
-    table = pa.table({
+    return pa.table({
         "model_id": col("model_id", pa.string()),
         "unique_id": col("unique_id", pa.string()),
         "subject": col("subject", pa.string()),
@@ -149,23 +157,25 @@ def _write_shard(path: Path, rows: list[dict], pa_logit) -> None:
         "kept_logits": pa.array([r["kept_logits"].astype(np_logit) for r in rows],
                                 type=pa.list_(pa_logit)),
     })
-    pq.write_table(table, path, compression="zstd")
 
 
 def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                        temperature: float | None = None, top_p: float | None = None,
-                       limit: int | None = None, shard_size: int = 1,
+                       limit: int | None = None,
                        max_batch_tokens: int = 24000, device: str = "cuda",
                        logit_dtype: str = "float16", progress_every: int = 50):
-    """Compute the per-token nucleus store for ``pool`` and write sharded parquets +
-    ``_stats.json`` + ``_meta.json``. Returns ``(stats, paths)``. Nucleus sizes are
-    recorded at their true top-p extent (uncapped).
+    """Compute the per-token nucleus store for ``pool`` and write a single
+    ``token_nuclei.parquet`` + ``_stats.json`` + ``_meta.json``. Returns
+    ``(stats, paths)``. Nucleus sizes are recorded at their true top-p extent
+    (uncapped). Rows are streamed one problem's row-group at a time, so peak memory
+    stays bounded regardless of pool size, and a per-``unique_id`` read stays cheap.
 
     ``temperature`` / ``top_p`` set the regime at which the per-token nucleus is
     measured. Default to ``GenConfig()`` (T=0.6, top_p=0.95) -- the canonical
     thinking-pool regime. For self-consistent analysis on a non-canonical pool,
     pass the same regime the pool was sampled with."""
     import pyarrow as pa
+    import pyarrow.parquet as pq
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -211,24 +221,28 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
               flush=True)
     problems = sorted(by_problem, key=lambda u: (by_problem[u][0][0].get("subject") or "", u))
     n_roll = sum(len(v) for v in by_problem.values())
-    print(f"{len(problems)} problems, {n_roll} rollouts -> shards of {shard_size} "
-          f"problem(s)", flush=True)
+    print(f"{len(problems)} problems, {n_roll} rollouts -> token_nuclei.parquet", flush=True)
 
     slug = model_slug(model_id)
-    shard_dir = Path(out_dir) / "generations" / slug / f"{pool}_token_nuclei"
-    shard_dir.mkdir(parents=True, exist_ok=True)
+    out_dir_path = Path(out_dir) / "generations" / slug / f"{pool}_token_nuclei"
+    out_dir_path.mkdir(parents=True, exist_ok=True)
+    nuclei_path = out_dir_path / "token_nuclei.parquet"
 
     # Headline counters only. The full size distribution, per-difficulty bands, and
-    # correct/incorrect splits are now computed POST-HOC from the written shards by
+    # correct/incorrect splits are now computed POST-HOC from the written store by
     # ``math_rollouts.analysis.nuclei_stats.summarize_nuclei`` — keeping this compute
     # path free of analysis/difficulty concerns.
     n_tokens = singleton_count = n_done = problems_done = 0
 
-    for shard_idx, start in enumerate(range(0, len(problems), shard_size)):
-        chunk_uids = problems[start:start + shard_size]
+    # Stream one problem's rows per row-group into a single file. Row-groups are
+    # per-``unique_id``, so parquet column statistics let a filtered read skip
+    # non-matching groups (see data.hf.load_token_nuclei). The writer is opened lazily
+    # from the first row-group's schema so it matches byte-for-byte.
+    writer = None
+    for uid in problems:
         items = [{"row": r, "prompt": prompt_cache[uid], "comp": comp,
                   "seq_len": len(prompt_cache[uid]) + len(comp)}
-                 for uid in chunk_uids for r, comp in by_problem[uid]]
+                 for r, comp in by_problem[uid]]
         items.sort(key=lambda x: x["seq_len"])
         rows: list[dict] = []
         for batch in _pack_batches(items, max_batch_tokens):
@@ -266,13 +280,19 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
                 singleton_count += int((sizes == 1).sum())
                 n_done += 1
             del logits
-        name = (chunk_uids[0].replace("/", "_") + ".parquet") if shard_size == 1 \
-            else f"shard-{shard_idx:05d}.parquet"
-        _write_shard(shard_dir / name, rows, pa_logit)
-        problems_done += len(chunk_uids)
-        if progress_every and problems_done % progress_every < shard_size:
+        if rows:
+            table = _rows_to_table(rows, pa_logit)
+            if writer is None:
+                writer = pq.ParquetWriter(nuclei_path, table.schema, compression="zstd")
+            writer.write_table(table)
+        problems_done += 1
+        if progress_every and problems_done % progress_every == 0:
             print(f"  {problems_done}/{len(problems)} problems, {n_done}/{n_roll} rollouts",
                   flush=True)
+    if writer is None:                          # pool had no scorable rollouts
+        pq.write_table(_rows_to_table([], pa_logit), nuclei_path, compression="zstd")
+    else:
+        writer.close()
 
     stats = {
         "n_rollouts": n_done,
@@ -288,17 +308,19 @@ def build_token_nuclei(model_id: str, pool: str, out_dir: str | Path, *,
         "nucleus_size": "true top-p extent (uncapped)",
         "keep_rule": {"singleton_keep": SINGLETON_KEEP, "branch_min": BRANCH_MIN,
                       "branch_max": "uncapped"},
-        "n_rollouts": n_done, "n_problems": len(problems), "shard_size": shard_size,
+        "n_rollouts": n_done, "n_problems": len(problems),
+        "layout": "single token_nuclei.parquet; one row-group per unique_id",
         "columns": "kept_ids/kept_logits are FLAT, split per position on keep_counts "
                    "(see math_rollouts.analysis.token_nuclei.unpack_kept)",
     }
-    (shard_dir / "_stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
-    (shard_dir / "_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    (out_dir_path / "_stats.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    (out_dir_path / "_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
     _print_summary(stats, pool, model_id)
-    print(f"\nwrote {len(range(0, len(problems), shard_size))} shards + _stats.json + "
-          f"_meta.json to {shard_dir}", flush=True)
-    return stats, {"dir": shard_dir, "stats": shard_dir / "_stats.json",
-                   "meta": shard_dir / "_meta.json"}
+    print(f"\nwrote token_nuclei.parquet ({n_done} rollouts) + _stats.json + _meta.json "
+          f"to {out_dir_path}", flush=True)
+    return stats, {"dir": out_dir_path, "nuclei": nuclei_path,
+                   "stats": out_dir_path / "_stats.json",
+                   "meta": out_dir_path / "_meta.json"}
 
 
 def _print_summary(stats: dict, pool: str, model_id: str) -> None:
@@ -318,8 +340,6 @@ def main() -> None:
     ap.add_argument("--pool", default="math500_passK")
     ap.add_argument("--out-root", default=".")
     ap.add_argument("--limit", type=int, default=None)
-    ap.add_argument("--shard-size", type=int, default=1,
-                    help="problems per shard (1 = per-problem; raise for math12k pools)")
     ap.add_argument("--logit-dtype", default="float16", choices=["float16", "float32"],
                     help="float16 (default) matches the bf16 compute precision and halves "
                          "the logit bytes; use float32 if your pyarrow can't write float16")
@@ -327,7 +347,7 @@ def main() -> None:
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
     build_token_nuclei(a.model_id, a.pool, a.out_root, limit=a.limit,
-                       shard_size=a.shard_size, logit_dtype=a.logit_dtype,
+                       logit_dtype=a.logit_dtype,
                        max_batch_tokens=a.max_batch_tokens, device=a.device)
 
 

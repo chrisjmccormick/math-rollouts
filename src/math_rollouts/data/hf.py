@@ -45,25 +45,35 @@ def experiment_dir(model_id: str, experiment: str) -> str:
 
 
 def load_token_nuclei(model_id: str, pool: str, unique_id: str, **kw):
-    """Load one problem's per-token nucleus shard from
-    ``generations/<slug>/<pool>_token_nuclei/<uid-slug>.parquet`` (per-problem
-    sharding, the default). ``unique_id`` ``train/geometry/9467`` ->
-    ``train_geometry_9467.parquet``. Raises if the shard isn't present (the store
-    is produced by ``analysis.token_nuclei`` and may not exist yet)."""
+    """Load one problem's rows from the pool's single ``token_nuclei.parquet``
+    (``generations/<slug>/<pool>_token_nuclei/token_nuclei.parquet``), filtered on
+    ``unique_id`` — each problem is its own row-group, so the filter reads only that
+    group. Falls back to a legacy per-problem shard (``<uid-slug>.parquet``, e.g.
+    ``train/geometry/9467`` -> ``train_geometry_9467.parquet``) if the store predates
+    the single-file layout. Raises if neither is present (the store is produced by
+    ``analysis.token_nuclei`` and may not exist yet)."""
     import pandas as pd
-    slug = unique_id.replace("/", "_")
-    rel = f"generations/{model_slug(model_id)}/{pool}_token_nuclei/{slug}.parquet"
-    return pd.read_parquet(_resolve(rel, **kw))
+    rel_dir = f"generations/{model_slug(model_id)}/{pool}_token_nuclei"
+    try:
+        single = _resolve(f"{rel_dir}/token_nuclei.parquet", **kw)
+    except Exception:
+        single = None
+    if single is not None:
+        return pd.read_parquet(
+            single, filters=[("unique_id", "==", unique_id)]).reset_index(drop=True)
+    slug = unique_id.replace("/", "_")          # legacy per-problem shard
+    return pd.read_parquet(_resolve(f"{rel_dir}/{slug}.parquet", **kw))
 
 
 def load_token_nuclei_pool(model_id: str, pool: str, *, columns: list[str] | None = None,
                            local_root: str | Path | None = None,
                            repo_id: str = DATASET_REPO, revision: str | None = None):
-    """Load and concatenate ALL per-problem nucleus shards for ``pool`` into one
-    DataFrame (the bulk counterpart to ``load_token_nuclei``, which reads a single
-    problem). Resolves a local snapshot (``local_root`` or ``$MATH_ROLLOUTS_DATA``)
-    if present, else pulls just the ``<pool>_token_nuclei/*.parquet`` shards from the
-    hub via ``snapshot_download``.
+    """Load the whole per-token nucleus store for ``pool`` (single
+    ``token_nuclei.parquet``) into one DataFrame — the bulk counterpart to
+    ``load_token_nuclei``, which reads a single problem. Resolves a local snapshot
+    (``local_root`` or ``$MATH_ROLLOUTS_DATA``) if present, else pulls the store from
+    the hub. Falls back to concatenating legacy per-problem shards if the single file
+    isn't present.
 
     ``columns`` is forwarded to ``read_parquet`` — pass the light columns (e.g.
     ``["unique_id", "answer_matches", "nuc_sizes", "chosen_is_top1"]``) to skip the bulky
@@ -72,17 +82,21 @@ def load_token_nuclei_pool(model_id: str, pool: str, *, columns: list[str] | Non
 
     rel_dir = f"generations/{model_slug(model_id)}/{pool}_token_nuclei"
     root = local_root or os.environ.get("MATH_ROLLOUTS_DATA")
-    shard_dir = None
+    if root and (Path(root) / rel_dir / "token_nuclei.parquet").exists():
+        return pd.read_parquet(Path(root) / rel_dir / "token_nuclei.parquet", columns=columns)
     if root and (Path(root) / rel_dir).is_dir():
-        shard_dir = Path(root) / rel_dir
+        shard_dir = Path(root) / rel_dir       # legacy local shards
     else:
         from huggingface_hub import snapshot_download
         snap = snapshot_download(repo_id=repo_id, repo_type="dataset", revision=revision,
                                  allow_patterns=f"{rel_dir}/*.parquet")
         shard_dir = Path(snap) / rel_dir
-    shards = sorted(shard_dir.glob("*.parquet"))
+    single = shard_dir / "token_nuclei.parquet"
+    if single.exists():
+        return pd.read_parquet(single, columns=columns)
+    shards = sorted(shard_dir.glob("*.parquet"))    # legacy per-problem shards
     if not shards:
-        raise FileNotFoundError(f"no nucleus shards under {shard_dir}")
+        raise FileNotFoundError(f"no token_nuclei.parquet (or legacy shards) under {shard_dir}")
     return pd.concat([pd.read_parquet(p, columns=columns) for p in shards],
                      ignore_index=True)
 
